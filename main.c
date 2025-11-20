@@ -1022,8 +1022,24 @@ static void taint_track(zend_ast *ast) {
           zval *zv = zend_ast_get_zval(name_node);
           if (zv && Z_TYPE_P(zv) == IS_STRING) {
             zend_string *var_name = zend_ast_get_str(name_node);
+            const char *var_name_str = Z_STRVAL_P(zv);
             // 检查数组的基变量（如 $_GET、$_POST）是否在 source table 中
-            if (zend_hash_exists(&var_source_table, var_name)) {
+            // 改进：也检查 $POST 这种可能的拼写错误（应该是 $_POST）
+            bool is_superglobal = false;
+            if (strcmp(var_name_str, "POST") == 0 ||
+                strcmp(var_name_str, "GET") == 0 ||
+                strcmp(var_name_str, "REQUEST") == 0 ||
+                (strlen(var_name_str) > 0 && var_name_str[0] == '_' &&
+                 (strcmp(var_name_str, "_POST") == 0 || 
+                  strcmp(var_name_str, "_GET") == 0 ||
+                  strcmp(var_name_str, "_REQUEST") == 0 ||
+                  strcmp(var_name_str, "_SERVER") == 0 ||
+                  strcmp(var_name_str, "_COOKIE") == 0 ||
+                  strcmp(var_name_str, "_FILES") == 0))) {
+              is_superglobal = true;
+            }
+            
+            if (zend_hash_exists(&var_source_table, var_name) || is_superglobal) {
               printf("检测到数组访问污点源: %s[...] (var_name=%s)\n", Z_STRVAL_P(zv), Z_STRVAL_P(zv));
               // 标记整个 DIM 节点为污点
               current->tainted = 1;
@@ -1680,6 +1696,29 @@ static void webshell_check(zend_ast *ast, bool local) {
           }
         }
         
+        // 检查字符串反转后的危险函数名（用于检测混淆代码）
+        // 例如：strrev("noitcnuf_etaerc") = "create_function"
+        const char *reversed_dangerous_funcs[] = {
+          "noitcnuf_etaerc",  // create_function 反转
+          "laver",            // eval 反转
+          "tressa",           // assert 反转
+          "cexe",             // exec 反转
+          "metsys",           // system 反转
+          "cexe_llahs",       // shell_exec 反转
+          "urhtsap",          // passthru 反转
+        };
+        int reversed_func_count = sizeof(reversed_dangerous_funcs) / sizeof(reversed_dangerous_funcs[0]);
+        for (int i = 0; i < reversed_func_count; i++) {
+          if (strstr(str_val, reversed_dangerous_funcs[i]) != NULL) {
+            printf("检测到字符串常量中包含反转的危险函数名: %s (可能是混淆代码)\n", reversed_dangerous_funcs[i]);
+            if (!local)
+              webshell = 1;
+            else
+              local_webshell = 1;
+            break;
+          }
+        }
+        
         // 检查序列化数据中的webshell特征
         if (strstr(str_val, "\"pass\"") != NULL || 
             strstr(str_val, "\"backdoor\"") != NULL ||
@@ -1933,9 +1972,14 @@ static void webshell_check(zend_ast *ast, bool local) {
     if (current->kind == ZEND_AST_CALL) {
       zend_ast *name_node = current->child[0];
       if (name_node) {
+        // 调试：输出函数名节点类型
+        printf("DEBUG: webshell_check 检测到函数调用，函数名节点类型: kind=%d (ZEND_AST_ZVAL=%d, ZEND_AST_VAR=%d, ZEND_AST_DIM=%d)\n", 
+               name_node->kind, ZEND_AST_ZVAL, ZEND_AST_VAR, ZEND_AST_DIM);
+        // 保存原始 name_node，避免在 if 分支中被修改
+        zend_ast *original_name_node = name_node;
         // assert($_POST['cmd'])
-        if (name_node->kind == ZEND_AST_ZVAL) {
-          zval *zv = zend_ast_get_zval(name_node);
+        if (original_name_node->kind == ZEND_AST_ZVAL) {
+          zval *zv = zend_ast_get_zval(original_name_node);
           // 提前声明回调函数检测相关的变量，确保它们在后续代码中可用
           bool has_tainted_arg = false;
           bool has_dangerous_callback = false;
@@ -1944,7 +1988,7 @@ static void webshell_check(zend_ast *ast, bool local) {
           bool has_hex_encoded_danger = false;
           zend_string *func_name_for_callback = NULL;
           if (zv && Z_TYPE_P(zv) == IS_STRING) {
-            zend_string *func_name = zend_ast_get_str(name_node);
+            zend_string *func_name = zend_ast_get_str(original_name_node);
             printf("DEBUG: 检测到函数调用: %s (kind=%d, tainted=%d)\n", Z_STRVAL_P(zv), current->kind, current->tainted);
             printf("DEBUG: sink_func_table存在=%d, sink_table存在=%d, webshell_table存在=%d\n", 
                    zend_hash_exists(&sink_func_table, func_name),
@@ -1987,6 +2031,17 @@ static void webshell_check(zend_ast *ast, bool local) {
                 memcmp(ZSTR_VAL(func_name), "unserialize", 11) == 0) {
               // unserialize 调用本身就很可疑，特别是如果参数是字符串常量
               printf("检测到 unserialize 调用（可能用于触发反序列化漏洞）\n");
+              if (!local)
+                webshell = 1;
+              else
+                local_webshell = 1;
+            }
+            
+            // 检测 create_function 调用（即使参数不是污点也应该检测，因为 create_function 本身就很危险）
+            if (func_name && ZSTR_LEN(func_name) == 15 &&
+                memcmp(ZSTR_VAL(func_name), "create_function", 15) == 0) {
+              // create_function 调用本身就很可疑，特别是如果参数包含字符串拼接或反转
+              printf("检测到 create_function 调用（用于动态创建函数，可能用于混淆代码）\n");
               if (!local)
                 webshell = 1;
               else
@@ -2644,7 +2699,9 @@ static void webshell_check(zend_ast *ast, bool local) {
               } else if (func_name_for_callback && zend_hash_exists(&webshell_table, func_name_for_callback)) {
                 should_detect = true;
                 printf("DEBUG: 通过 webshell_table 检测触发 (func_name=%s)\n", ZSTR_VAL(func_name_for_callback));
-              } else if (func_name_for_callback && (zend_hash_exists(&sink_func_table, func_name_for_callback)) && has_tainted_arg) {
+              } else if (func_name_for_callback && (zend_hash_exists(&sink_func_table, func_name_for_callback))) {
+                // 改进：对于 sink_func_table 中的函数（如 create_function），即使参数不是污点也应该检测
+                // 因为这些函数本身就很危险，通常用于混淆代码
                 should_detect = true;
                 printf("DEBUG: 通过 sink_func_table 检测触发 (func_name=%s, has_tainted_arg=%d)\n", 
                        ZSTR_VAL(func_name_for_callback), has_tainted_arg);
@@ -2670,10 +2727,16 @@ static void webshell_check(zend_ast *ast, bool local) {
                 local_webshell = 1;
             }
           }
-        } else if (name_node->kind == ZEND_AST_VAR) { // $a = "assert"; $a($_POST['cmd']); $a = $_POST['func']; $b = $_POST['cmd']; $a($b);
+        }
+        if (name_node && name_node->kind == ZEND_AST_VAR) { // $a = "assert"; $a($_POST['cmd']); $a = $_POST['func']; $b = $_POST['cmd']; $a($b);
+          printf("DEBUG: 进入变量函数调用检测分支，name_node->kind=%d (ZEND_AST_VAR=%d)\n", name_node->kind, ZEND_AST_VAR);
           name_node = name_node->child[0];
+          printf("DEBUG: name_node->child[0] = %p, kind=%d (ZEND_AST_ZVAL=%d)\n", 
+                 name_node, name_node ? name_node->kind : -1, ZEND_AST_ZVAL);
           if (name_node && name_node->kind == ZEND_AST_ZVAL) {
             zval *zv = zend_ast_get_zval(name_node);
+            printf("DEBUG: zv = %p, Z_TYPE_P(zv) = %d (IS_STRING=%d)\n", 
+                   zv, zv ? Z_TYPE_P(zv) : -1, IS_STRING);
             if (zv && Z_TYPE_P(zv) == IS_STRING) {
               zend_string *var_name = zend_ast_get_str(name_node);
               printf("the var name is %s\n", Z_STRVAL_P(zv));
@@ -2683,6 +2746,8 @@ static void webshell_check(zend_ast *ast, bool local) {
               bool is_sink_var = zend_hash_exists(&sink_var_table, var_name);
               bool is_tainted_var = zend_hash_exists(&tainted_table, var_name);
               bool has_tainted_args = (current->tainted == 1);
+              bool has_complex_args = false;  // 提前声明，用于后续检查
+              bool has_bitwise_args = false;  // 提前声明，用于后续检查
               
               // Debug: print hash table lookup results
               printf("DEBUG: 检查变量 $%s - sink_var_table存在=%d, tainted_table存在=%d, current->tainted=%d\n", 
@@ -2731,13 +2796,17 @@ static void webshell_check(zend_ast *ast, bool local) {
                                 if (var_zv && Z_TYPE_P(var_zv) == IS_STRING) {
                                   const char *var_name = Z_STRVAL_P(var_zv);
                                   // 检查是否是超全局变量（$_POST, $_GET, $_REQUEST, $_SERVER, $_COOKIE, $_FILES）
-                                  if (strlen(var_name) > 0 && var_name[0] == '_' &&
-                                      (strcmp(var_name, "_POST") == 0 || 
-                                       strcmp(var_name, "_GET") == 0 ||
-                                       strcmp(var_name, "_REQUEST") == 0 ||
-                                       strcmp(var_name, "_SERVER") == 0 ||
-                                       strcmp(var_name, "_COOKIE") == 0 ||
-                                       strcmp(var_name, "_FILES") == 0)) {
+                                  // 注意：$POST 可能是 $_POST 的拼写错误或混淆手段
+                                  if (strcmp(var_name, "POST") == 0 ||
+                                      strcmp(var_name, "GET") == 0 ||
+                                      strcmp(var_name, "REQUEST") == 0 ||
+                                      (strlen(var_name) > 0 && var_name[0] == '_' &&
+                                       (strcmp(var_name, "_POST") == 0 || 
+                                        strcmp(var_name, "_GET") == 0 ||
+                                        strcmp(var_name, "_REQUEST") == 0 ||
+                                        strcmp(var_name, "_SERVER") == 0 ||
+                                        strcmp(var_name, "_COOKIE") == 0 ||
+                                        strcmp(var_name, "_FILES") == 0))) {
                                     printf("DEBUG: 检测到参数是超全局变量访问: $%s[...]\n", var_name);
                                     has_tainted_args = true;
                                     break;
@@ -2764,6 +2833,23 @@ static void webshell_check(zend_ast *ast, bool local) {
                               printf("DEBUG: 检测到参数是变量变量，可能是混淆的超全局变量\n");
                               has_tainted_args = true;
                               break;
+                            } else if (var_name_node && var_name_node->kind == ZEND_AST_ZVAL) {
+                              // 检查参数变量是否在 tainted_table 中
+                              zval *arg_var_zv = zend_ast_get_zval(var_name_node);
+                              if (arg_var_zv && Z_TYPE_P(arg_var_zv) == IS_STRING) {
+                                zend_string *arg_var_name = zend_ast_get_str(var_name_node);
+                                if (arg_var_name && zend_hash_exists(&tainted_table, arg_var_name)) {
+                                  printf("DEBUG: 检测到参数变量 $%s 在 tainted_table 中\n", Z_STRVAL_P(arg_var_zv));
+                                  has_tainted_args = true;
+                                  break;
+                                }
+                              }
+                            }
+                            // 改进：如果参数是变量，即使无法获取变量名，也应该标记为复杂参数
+                            // 因为变量参数本身就很可疑（特别是用于函数调用时）
+                            if (!has_tainted_args) {
+                              printf("DEBUG: 检测到参数是变量（kind=ZEND_AST_VAR），标记为复杂参数\n");
+                              has_complex_args = true;
                             }
                           }
                         }
@@ -2801,9 +2887,7 @@ static void webshell_check(zend_ast *ast, bool local) {
               }
               
               // 对于混淆代码，如果变量需要动态解析，且参数是变量（可能是混淆的），也应该检测
-              // 检查参数是否是变量或复杂表达式
-              bool has_complex_args = false;
-              bool has_bitwise_args = false;
+              // 检查参数是否是变量或复杂表达式（has_complex_args 和 has_bitwise_args 已在前面声明）
               if (current->kind == ZEND_AST_CALL) {
                 zend_ast **children = ast_get_children(current, &count);
                 if (children && count > 1) {
@@ -2833,6 +2917,64 @@ static void webshell_check(zend_ast *ast, bool local) {
                 }
               }
               
+              // 改进：检查函数名变量是否来自超全局变量访问（如 $_ = $POST['1']）
+              // 如果函数名变量来自超全局变量访问，且参数也来自超全局变量访问，应该直接检测
+              bool func_name_from_superglobal = false;
+              if (g_root_ast) {
+                // 遍历 AST 查找该变量的赋值语句
+                zend_ast **root_children = ast_get_children(g_root_ast, &count);
+                if (root_children) {
+                  for (uint32_t i = 0; i < count; i++) {
+                    zend_ast *stmt = root_children[i];
+                    if (stmt && stmt->kind == ZEND_AST_ASSIGN) {
+                      zend_ast *assign_var = stmt->child[0];
+                      zend_ast *assign_value = stmt->child[1];
+                      if (assign_var && assign_var->kind == ZEND_AST_VAR) {
+                        zend_ast *assign_var_name_node = assign_var->child[0];
+                        if (assign_var_name_node && assign_var_name_node->kind == ZEND_AST_ZVAL) {
+                          zval *assign_var_zv = zend_ast_get_zval(assign_var_name_node);
+                          if (assign_var_zv && Z_TYPE_P(assign_var_zv) == IS_STRING) {
+                            zend_string *assign_var_name = zend_ast_get_str(assign_var_name_node);
+                            if (assign_var_name && zend_string_equals(assign_var_name, var_name)) {
+                              // 找到了该变量的赋值语句，检查赋值来源
+                              if (assign_value && assign_value->kind == ZEND_AST_DIM) {
+                                zend_ast *dim_base = assign_value->child[0];
+                                if (dim_base && dim_base->kind == ZEND_AST_VAR) {
+                                  zend_ast *dim_var_name_node = dim_base->child[0];
+                                  if (dim_var_name_node && dim_var_name_node->kind == ZEND_AST_ZVAL) {
+                                    zval *dim_var_zv = zend_ast_get_zval(dim_var_name_node);
+                                    if (dim_var_zv && Z_TYPE_P(dim_var_zv) == IS_STRING) {
+                                      const char *dim_var_name = Z_STRVAL_P(dim_var_zv);
+                                      // 检查是否是超全局变量（$_POST, $_GET, $POST 等）
+                                      // 注意：$POST 可能是 $_POST 的拼写错误或混淆手段
+                                      if (strcmp(dim_var_name, "POST") == 0 ||
+                                          strcmp(dim_var_name, "GET") == 0 ||
+                                          strcmp(dim_var_name, "REQUEST") == 0 ||
+                                          (strlen(dim_var_name) > 0 && dim_var_name[0] == '_' &&
+                                           (strcmp(dim_var_name, "_POST") == 0 || 
+                                            strcmp(dim_var_name, "_GET") == 0 ||
+                                            strcmp(dim_var_name, "_REQUEST") == 0 ||
+                                            strcmp(dim_var_name, "_SERVER") == 0 ||
+                                            strcmp(dim_var_name, "_COOKIE") == 0 ||
+                                            strcmp(dim_var_name, "_FILES") == 0))) {
+                                        func_name_from_superglobal = true;
+                                        printf("DEBUG: 检测到函数名变量 $%s 来自超全局变量访问: $%s[...]\n", 
+                                               Z_STRVAL_P(zv), dim_var_name);
+                                        break;
+                                      }
+                                    }
+                                  }
+                                }
+                              }
+                            }
+                          }
+                        }
+                      }
+                    }
+                  }
+                }
+              }
+              
               // 改进：对于变量函数调用，如果参数是污点或复杂表达式（如超全局变量访问、变量变量），应该检测
               // 即使函数名变量不在 sink_var_table 中，如果参数是污点或复杂表达式，也应该检测
               // 特别是对于混淆的代码（如使用位运算构造函数名），参数是超全局变量访问时应该检测
@@ -2844,8 +2986,33 @@ static void webshell_check(zend_ast *ast, bool local) {
               // 即使参数不是污点，如果函数名和参数都包含位运算，也应该检测（高度可疑）
               // 如果变量无法静态评估（var_has_bitwise_assignment），且参数包含位运算或复杂表达式，也应该检测
               // 最宽松的策略：如果参数是污点或复杂表达式（如超全局变量访问、变量变量），就应该检测
-              if (is_sink_var || 
-                  (is_tainted_var && has_tainted_args) || 
+              // 改进：如果变量在 sink_var_table 中（是危险函数变量），无论参数如何都应该检测
+              // 因为危险函数变量（如 $func = "create_function"）的调用本身就是危险的
+              // 改进：如果函数名变量来自超全局变量访问，且参数也来自超全局变量访问，应该直接检测
+              // 改进：如果函数名变量是污点变量（来自用户输入），即使参数不是污点，也应该检测
+              // 因为函数名来自用户输入本身就是危险的（动态函数调用）
+              if (is_sink_var) {
+                // 如果变量是危险函数变量，直接检测（无论参数如何）
+                printf("检测到危险函数变量调用: $%s (sink_var=1, 变量是危险函数变量，直接检测)\n", Z_STRVAL_P(zv));
+                if (!local)
+                  webshell = 1;
+                else
+                  local_webshell = 1;
+              } else if (is_tainted_var && (has_tainted_args || has_complex_args)) {
+                // 如果函数名变量是污点变量（来自用户输入），且参数是污点或复杂表达式，直接检测
+                printf("检测到危险函数变量调用: $%s (函数名是污点变量，参数是污点或复杂表达式，直接检测)\n", Z_STRVAL_P(zv));
+                if (!local)
+                  webshell = 1;
+                else
+                  local_webshell = 1;
+              } else if (func_name_from_superglobal && (has_tainted_args || has_complex_args)) {
+                // 如果函数名变量来自超全局变量访问，且参数是污点或复杂表达式，直接检测
+                printf("检测到危险函数变量调用: $%s (函数名来自超全局变量访问，参数是污点或复杂表达式，直接检测)\n", Z_STRVAL_P(zv));
+                if (!local)
+                  webshell = 1;
+                else
+                  local_webshell = 1;
+              } else if ((is_tainted_var && has_tainted_args) || 
                   (needs_dynamic_resolve && (has_tainted_args || has_complex_args || has_bitwise_args)) ||
                   (var_has_bitwise_assignment && (has_complex_args || has_bitwise_args)) ||
                   has_tainted_args || has_complex_args) {
@@ -2914,8 +3081,12 @@ static void webshell_check(zend_ast *ast, bool local) {
                 }
                 // 改进：对于 $GLOBALS 和 $_SESSION 数组访问，如果用于函数调用，应该检测
                 // 因为这些数组经常被用于存储混淆的函数名
+                // 改进：也检查 $POST 这种可能的拼写错误（应该是 $_POST）
                 if (strcmp(var_name_str, "GLOBALS") == 0 || 
                     strcmp(var_name_str, "_SESSION") == 0 ||
+                    strcmp(var_name_str, "POST") == 0 ||
+                    strcmp(var_name_str, "GET") == 0 ||
+                    strcmp(var_name_str, "REQUEST") == 0 ||
                     (strlen(var_name_str) > 0 && var_name_str[0] == '_' &&
                      (strcmp(var_name_str, "_POST") == 0 || 
                       strcmp(var_name_str, "_GET") == 0 ||
@@ -2984,13 +3155,17 @@ static void webshell_check(zend_ast *ast, bool local) {
                             zval *arg_zv = zend_ast_get_zval(arg_var_name_node);
                             if (arg_zv && Z_TYPE_P(arg_zv) == IS_STRING) {
                               const char *arg_var_name = Z_STRVAL_P(arg_zv);
-                              if (strlen(arg_var_name) > 0 && arg_var_name[0] == '_' &&
-                                  (strcmp(arg_var_name, "_POST") == 0 || 
-                                   strcmp(arg_var_name, "_GET") == 0 ||
-                                   strcmp(arg_var_name, "_REQUEST") == 0 ||
-                                   strcmp(arg_var_name, "_SERVER") == 0 ||
-                                   strcmp(arg_var_name, "_COOKIE") == 0 ||
-                                   strcmp(arg_var_name, "_FILES") == 0)) {
+                              // 改进：也检查 $POST 这种可能的拼写错误（应该是 $_POST）
+                              if (strcmp(arg_var_name, "POST") == 0 ||
+                                  strcmp(arg_var_name, "GET") == 0 ||
+                                  strcmp(arg_var_name, "REQUEST") == 0 ||
+                                  (strlen(arg_var_name) > 0 && arg_var_name[0] == '_' &&
+                                   (strcmp(arg_var_name, "_POST") == 0 || 
+                                    strcmp(arg_var_name, "_GET") == 0 ||
+                                    strcmp(arg_var_name, "_REQUEST") == 0 ||
+                                    strcmp(arg_var_name, "_SERVER") == 0 ||
+                                    strcmp(arg_var_name, "_COOKIE") == 0 ||
+                                    strcmp(arg_var_name, "_FILES") == 0))) {
                                 has_tainted_args = true;
                                 printf("DEBUG: 检测到参数是超全局变量访问: $%s[...]\n", arg_var_name);
                               }
