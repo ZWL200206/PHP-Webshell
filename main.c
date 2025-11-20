@@ -1716,7 +1716,7 @@ static void webshell_check(zend_ast *ast, bool local) {
             (strstr(str_val, "eval(") != NULL && strstr(str_val, "$_POST") != NULL) ||
             (strstr(str_val, "eval(") != NULL && strstr(str_val, "$_GET") != NULL) ||
             (strstr(str_val, "eval(") != NULL && strstr(str_val, "$_REQUEST") != NULL)) {
-          printf("检测到字符串常量中包含危险函数调用模式（如 assert(\$_POST[...])）\n");
+          printf("检测到字符串常量中包含危险函数调用模式（如 assert($_POST[...])）\n");
           if (!local)
             webshell = 1;
           else
@@ -1728,7 +1728,7 @@ static void webshell_check(zend_ast *ast, bool local) {
             (strstr(str_val, "exec(") != NULL && (strstr(str_val, "$_GET") != NULL || strstr(str_val, "$_POST") != NULL || strstr(str_val, "$_REQUEST") != NULL)) ||
             (strstr(str_val, "shell_exec(") != NULL && (strstr(str_val, "$_GET") != NULL || strstr(str_val, "$_POST") != NULL || strstr(str_val, "$_REQUEST") != NULL)) ||
             (strstr(str_val, "passthru(") != NULL && (strstr(str_val, "$_GET") != NULL || strstr(str_val, "$_POST") != NULL || strstr(str_val, "$_REQUEST") != NULL))) {
-          printf("检测到字符串常量中包含危险函数调用模式（如 system(\$_GET[...])）\n");
+          printf("检测到字符串常量中包含危险函数调用模式（如 system($_GET[...])）\n");
           if (!local)
             webshell = 1;
           else
@@ -1936,6 +1936,13 @@ static void webshell_check(zend_ast *ast, bool local) {
         // assert($_POST['cmd'])
         if (name_node->kind == ZEND_AST_ZVAL) {
           zval *zv = zend_ast_get_zval(name_node);
+          // 提前声明回调函数检测相关的变量，确保它们在后续代码中可用
+          bool has_tainted_arg = false;
+          bool has_dangerous_callback = false;
+          bool has_suspicious_callback = false;
+          bool has_dangerous_regex = false;
+          bool has_hex_encoded_danger = false;
+          zend_string *func_name_for_callback = NULL;
           if (zv && Z_TYPE_P(zv) == IS_STRING) {
             zend_string *func_name = zend_ast_get_str(name_node);
             printf("DEBUG: 检测到函数调用: %s (kind=%d, tainted=%d)\n", Z_STRVAL_P(zv), current->kind, current->tainted);
@@ -1987,10 +1994,10 @@ static void webshell_check(zend_ast *ast, bool local) {
             }
             
             // 检查参数列表中是否有污点参数
-            bool has_tainted_arg = false;
             if (current->tainted == 1) {
               has_tainted_arg = true;
               printf("函数 %s 的调用节点本身被标记为污点\n", Z_STRVAL_P(zv));
+              printf("DEBUG: current->tainted == 1，准备跳到回调函数检测部分\n");
             } else {
               // 检查参数列表
               zend_ast **children = ast_get_children(current, &count);
@@ -2062,22 +2069,50 @@ static void webshell_check(zend_ast *ast, bool local) {
             }
             
             // 检查回调函数参数（对于接受回调的函数，如 array_intersect_ukey, array_filter 等）
-            bool has_dangerous_callback = false;
-            bool has_suspicious_callback = false;
-            bool has_dangerous_regex = false;
-            bool has_hex_encoded_danger = false;
+            // 重新获取 name_node 和 func_name，确保它们在回调函数检测时仍然有效
+            zend_ast *name_node_for_callback = current->child[0];
+            printf("DEBUG: 进入回调函数检测部分，name_node_for_callback=%p, current=%p\n", name_node_for_callback, current);
+            if (name_node_for_callback && name_node_for_callback->kind == ZEND_AST_ZVAL) {
+              printf("DEBUG: name_node_for_callback->kind == ZEND_AST_ZVAL\n");
+              zval *zv_callback = zend_ast_get_zval(name_node_for_callback);
+              if (zv_callback && Z_TYPE_P(zv_callback) == IS_STRING) {
+                func_name_for_callback = zend_ast_get_str(name_node_for_callback);
+                printf("DEBUG: 获取 func_name_for_callback: %s\n", func_name_for_callback ? ZSTR_VAL(func_name_for_callback) : "NULL");
+              } else {
+                printf("DEBUG: zv_callback 为空或不是字符串\n");
+              }
+            } else {
+              printf("DEBUG: name_node_for_callback 为空或不是 ZEND_AST_ZVAL (kind=%d)\n", name_node_for_callback ? name_node_for_callback->kind : -1);
+            }
+            
+            // 如果 func_name_for_callback 还没有被设置，尝试从 name_node_for_callback 获取
+            if (!func_name_for_callback && name_node_for_callback && name_node_for_callback->kind == ZEND_AST_ZVAL) {
+              zval *zv_callback = zend_ast_get_zval(name_node_for_callback);
+              if (zv_callback && Z_TYPE_P(zv_callback) == IS_STRING) {
+                func_name_for_callback = zend_ast_get_str(name_node_for_callback);
+              }
+            }
+            
             zend_ast **children = ast_get_children(current, &count);
+            printf("DEBUG: 准备检查回调函数参数，func_name_for_callback=%p, children=%p, count=%u\n", func_name_for_callback, children, count);
+            if (func_name_for_callback) {
+              printf("DEBUG: 开始检查回调函数参数，函数名=%s, children count=%u\n", ZSTR_VAL(func_name_for_callback), count);
+            } else {
+              printf("DEBUG: 开始检查回调函数参数，函数名为空, children count=%u\n", count);
+            }
             if (children && count > 1) {
               zend_ast *arg_list = children[1];
+              printf("DEBUG: arg_list=%p, kind=%d\n", arg_list, arg_list ? arg_list->kind : -1);
               if (arg_list && arg_list->kind == ZEND_AST_ARG_LIST) {
                 zend_ast_list *args = zend_ast_get_list(arg_list);
+                printf("DEBUG: args=%p, args->children=%u\n", args, args ? args->children : 0);
                 if (args && args->children > 0) {
                   // 对于 sprintf, echo, print 等输出函数，检查参数是否是十六进制编码的危险代码
-                  if (func_name && (
-                      (ZSTR_LEN(func_name) == 7 && memcmp(ZSTR_VAL(func_name), "sprintf", 7) == 0) ||
-                      (ZSTR_LEN(func_name) == 4 && memcmp(ZSTR_VAL(func_name), "echo", 4) == 0) ||
-                      (ZSTR_LEN(func_name) == 5 && memcmp(ZSTR_VAL(func_name), "print", 5) == 0) ||
-                      (ZSTR_LEN(func_name) == 6 && memcmp(ZSTR_VAL(func_name), "printf", 6) == 0))) {
+                  if (func_name_for_callback && (
+                      (ZSTR_LEN(func_name_for_callback) == 7 && memcmp(ZSTR_VAL(func_name_for_callback), "sprintf", 7) == 0) ||
+                      (ZSTR_LEN(func_name_for_callback) == 4 && memcmp(ZSTR_VAL(func_name_for_callback), "echo", 4) == 0) ||
+                      (ZSTR_LEN(func_name_for_callback) == 5 && memcmp(ZSTR_VAL(func_name_for_callback), "print", 5) == 0) ||
+                      (ZSTR_LEN(func_name_for_callback) == 6 && memcmp(ZSTR_VAL(func_name_for_callback), "printf", 6) == 0))) {
                     // 检查所有参数
                     for (uint32_t i = 0; i < args->children; i++) {
                       zend_ast *arg = args->child[i];
@@ -2093,7 +2128,7 @@ static void webshell_check(zend_ast *ast, bool local) {
                               if (contains_dangerous_function(decoded)) {
                                 has_hex_encoded_danger = true;
                                 printf("检测到十六进制编码的危险代码: %s 的参数包含十六进制编码的危险函数名（解码后: %s）\n", 
-                                       Z_STRVAL_P(zv), ZSTR_VAL(decoded));
+                                       func_name_for_callback ? ZSTR_VAL(func_name_for_callback) : "unknown", ZSTR_VAL(decoded));
                                 zend_string_release(decoded);
                                 zend_string_release(arg_str);
                                 break;
@@ -2107,8 +2142,8 @@ static void webshell_check(zend_ast *ast, bool local) {
                     }
                   }
                   // 对于 preg_replace，第一个参数是正则表达式，如果包含 /e 修饰符，是危险的
-                  if (func_name && ZSTR_LEN(func_name) == 12 && 
-                      memcmp(ZSTR_VAL(func_name), "preg_replace", 12) == 0 && 
+                  if (func_name_for_callback && ZSTR_LEN(func_name_for_callback) == 12 && 
+                      memcmp(ZSTR_VAL(func_name_for_callback), "preg_replace", 12) == 0 && 
                       args->children >= 1) {
                     zend_ast *regex_arg = args->child[0];
                     if (regex_arg) {
@@ -2129,7 +2164,7 @@ static void webshell_check(zend_ast *ast, bool local) {
                               for (size_t j = i + 1; j < regex_len; j++) {
                                 if (regex[j] == 'e') {
                                   has_dangerous_regex = true;
-                                  printf("检测到危险正则表达式修饰符: %s 的第一个参数包含 /e 修饰符\n", Z_STRVAL_P(zv));
+                                  printf("检测到危险正则表达式修饰符: %s 的第一个参数包含 /e 修饰符\n", func_name_for_callback ? ZSTR_VAL(func_name_for_callback) : "unknown");
                                   break;
                                 }
                               }
@@ -2149,11 +2184,11 @@ static void webshell_check(zend_ast *ast, bool local) {
                   // 对于 mb_eregi_replace, mb_ereg_replace, eregi_replace, ereg_replace 等函数，
                   // 如果最后一个参数是 'e'，会将替换字符串作为 PHP 代码执行，这是非常危险的
                   // 必须在回调函数检查之前执行，避免将 'e' 误判为回调函数
-                  printf("DEBUG: 开始检查 mb_ereg 系列函数，func_name=%p, args=%p\n", func_name, args);
+                  printf("DEBUG: 开始检查 mb_ereg 系列函数，func_name=%p, args=%p\n", func_name_for_callback, args);
                   bool is_mb_ereg_func = false;
-                  if (func_name) {
-                    size_t func_name_len = ZSTR_LEN(func_name);
-                    const char *func_name_str = ZSTR_VAL(func_name);
+                  if (func_name_for_callback) {
+                    size_t func_name_len = ZSTR_LEN(func_name_for_callback);
+                    const char *func_name_str = ZSTR_VAL(func_name_for_callback);
                     printf("DEBUG: 函数名: %s, 长度: %zu\n", func_name_str, func_name_len);
                     
                     // 检查是否是 mb_eregi_replace, mb_ereg_replace, eregi_replace, ereg_replace
@@ -2175,7 +2210,7 @@ static void webshell_check(zend_ast *ast, bool local) {
                     // 对于 mb_eregi_replace 等函数，检查最后一个参数（修饰符参数）是否为 'e'
                     zend_ast *modifier_arg = args->child[args->children - 1];
                     if (modifier_arg) {
-                      printf("DEBUG: 检查 %s 的最后一个参数（修饰符），参数索引: %u\n", Z_STRVAL_P(zv), args->children - 1);
+                      printf("DEBUG: 检查 %s 的最后一个参数（修饰符），参数索引: %u\n", func_name_for_callback ? ZSTR_VAL(func_name_for_callback) : "unknown", args->children - 1);
                       zend_string *modifier_str = evaluate_string_expression(modifier_arg);
                       if (modifier_str) {
                         const char *modifier = ZSTR_VAL(modifier_str);
@@ -2183,14 +2218,14 @@ static void webshell_check(zend_ast *ast, bool local) {
                         // 检查修饰符是否包含 'e'
                         if (strchr(modifier, 'e') != NULL) {
                           has_dangerous_regex = true;
-                          printf("检测到危险修饰符: %s 的最后一个参数包含 'e' 修饰符，会将替换字符串作为 PHP 代码执行\n", Z_STRVAL_P(zv));
+                          printf("检测到危险修饰符: %s 的最后一个参数包含 'e' 修饰符，会将替换字符串作为 PHP 代码执行\n", func_name_for_callback ? ZSTR_VAL(func_name_for_callback) : "unknown");
                         }
                         zend_string_release(modifier_str);
                       } else {
                         // 如果无法静态评估，但参数是污点，也应该检测
                         if (modifier_arg->tainted == 1) {
                           has_dangerous_regex = true;
-                          printf("检测到可疑修饰符参数（污点）: %s 的最后一个参数被标记为污点，可能是危险的\n", Z_STRVAL_P(zv));
+                          printf("检测到可疑修饰符参数（污点）: %s 的最后一个参数被标记为污点，可能是危险的\n", func_name_for_callback ? ZSTR_VAL(func_name_for_callback) : "unknown");
                         }
                       }
                     }
@@ -2198,7 +2233,7 @@ static void webshell_check(zend_ast *ast, bool local) {
                     // 因为即使没有 'e' 修饰符，使用污点参数也是可疑的
                     if (has_tainted_arg && !has_dangerous_regex) {
                       has_dangerous_regex = true;
-                      printf("检测到可疑的 %s 调用：参数包含污点\n", Z_STRVAL_P(zv));
+                      printf("检测到可疑的 %s 调用：参数包含污点\n", func_name_for_callback ? ZSTR_VAL(func_name_for_callback) : "unknown");
                     }
                   } else if (is_mb_ereg_func) {
                     printf("DEBUG: mb_ereg 函数但条件不满足: args=%p, children=%u\n", args, args ? args->children : 0);
@@ -2207,31 +2242,50 @@ static void webshell_check(zend_ast *ast, bool local) {
                   // 对于 array_intersect_ukey, array_filter 等函数，最后一个参数通常是回调函数
                   // 但是 preg_replace 和 mb_eregi_replace 等函数不是回调函数，所以跳过
                   bool is_regex_replace_func = false;
-                  if (func_name) {
-                    size_t func_name_len = ZSTR_LEN(func_name);
-                    if ((func_name_len == 12 && memcmp(ZSTR_VAL(func_name), "preg_replace", 12) == 0) ||
-                        (func_name_len == 16 && memcmp(ZSTR_VAL(func_name), "mb_eregi_replace", 16) == 0) ||
-                        (func_name_len == 15 && memcmp(ZSTR_VAL(func_name), "mb_ereg_replace", 15) == 0) ||
-                        (func_name_len == 14 && memcmp(ZSTR_VAL(func_name), "eregi_replace", 14) == 0) ||
-                        (func_name_len == 13 && memcmp(ZSTR_VAL(func_name), "ereg_replace", 13) == 0)) {
+                  if (func_name_for_callback) {
+                    size_t func_name_len = ZSTR_LEN(func_name_for_callback);
+                    if ((func_name_len == 12 && memcmp(ZSTR_VAL(func_name_for_callback), "preg_replace", 12) == 0) ||
+                        (func_name_len == 16 && memcmp(ZSTR_VAL(func_name_for_callback), "mb_eregi_replace", 16) == 0) ||
+                        (func_name_len == 15 && memcmp(ZSTR_VAL(func_name_for_callback), "mb_ereg_replace", 15) == 0) ||
+                        (func_name_len == 14 && memcmp(ZSTR_VAL(func_name_for_callback), "eregi_replace", 14) == 0) ||
+                        (func_name_len == 13 && memcmp(ZSTR_VAL(func_name_for_callback), "ereg_replace", 13) == 0)) {
                       is_regex_replace_func = true;
                     }
                   }
-                  if (func_name && !is_regex_replace_func) {
+                  // 对于所有函数（除了正则替换函数），都检查最后一个参数是否是回调函数
+                  // 这样可以检测到 array_intersect_uassoc, array_filter 等函数的回调参数
+                  if (func_name_for_callback && !is_regex_replace_func && args->children > 0) {
                     // 检查最后一个参数是否评估为危险函数名
+                    printf("DEBUG: 检查回调函数参数，函数名=%s, args->children=%u\n", ZSTR_VAL(func_name_for_callback), args->children);
                     zend_ast *callback_arg = args->child[args->children - 1];
                     if (callback_arg) {
+                      printf("DEBUG: 回调参数节点类型: kind=%d\n", callback_arg->kind);
                       zend_string *callback_name = evaluate_string_expression(callback_arg);
                       if (callback_name) {
                         printf("评估回调函数参数: %s\n", ZSTR_VAL(callback_name));
                         if (is_known_sink_function(callback_name)) {
                           has_dangerous_callback = true;
-                          printf("检测到危险回调函数: %s -> %s\n", Z_STRVAL_P(zv), ZSTR_VAL(callback_name));
+                          printf("检测到危险回调函数: %s -> %s\n", func_name_for_callback ? ZSTR_VAL(func_name_for_callback) : "unknown", ZSTR_VAL(callback_name));
                         }
                         zend_string_release(callback_name);
-                        // 即使评估结果不是危险函数名，如果回调参数是字符串拼接且包含污点变量，也应该检测
-                        // 因为评估结果可能不准确（如 $ch."ert" 可能被评估为 "0ert" 而不是实际的拼接结果）
-                        if (callback_arg->kind == ZEND_AST_BINARY_OP) {
+                      } else {
+                        printf("DEBUG: 无法评估回调函数参数（可能是变量或复杂表达式）\n");
+                      }
+                      
+                      // 无论评估结果如何，都要检查回调参数的类型和特征
+                      // 因为评估结果可能不准确（如 $ch."ert" 可能被评估为 "0ert" 而不是实际的拼接结果）
+                      // 或者变量通过位运算赋值，但评估时可能只评估到了部分表达式
+                      if (callback_arg->kind == ZEND_AST_BINARY_OP) {
+                        // 检查是否是位运算（异或、或、与）
+                        if (callback_arg->attr == ZEND_BW_XOR || 
+                            callback_arg->attr == ZEND_BW_OR || 
+                            callback_arg->attr == ZEND_BW_AND) {
+                          // 回调参数是位运算表达式，很可疑（通常用于混淆函数名）
+                          has_suspicious_callback = true;
+                          printf("检测到可疑回调函数参数（位运算）: %s 的回调参数是位运算表达式，可能是混淆代码\n", 
+                                 func_name_for_callback ? ZSTR_VAL(func_name_for_callback) : "unknown");
+                        } else {
+                          // 回调参数是二元操作（如字符串拼接），检查是否包含污点变量
                           // 回调参数是二元操作（如字符串拼接），检查是否包含污点变量
                           zend_ast *left = callback_arg->child[0];
                           zend_ast *right = callback_arg->child[1];
@@ -2282,99 +2336,63 @@ static void webshell_check(zend_ast *ast, bool local) {
                           if (has_tainted_operand) {
                             has_suspicious_callback = true;
                             printf("检测到可疑回调函数参数（字符串拼接包含污点变量）: %s 的回调参数是字符串拼接，且包含污点变量\n", 
-                                   Z_STRVAL_P(zv));
+                                   func_name_for_callback ? ZSTR_VAL(func_name_for_callback) : "unknown");
                           } else {
                             // 即使不包含污点变量，字符串拼接作为回调函数参数也很可疑（通常用于混淆）
                             has_suspicious_callback = true;
                             printf("检测到可疑回调函数参数（字符串拼接）: %s 的回调参数是字符串拼接，可能是混淆代码\n", 
-                                   Z_STRVAL_P(zv));
+                                   func_name_for_callback ? ZSTR_VAL(func_name_for_callback) : "unknown");
                           }
                         }
-                      } else {
-                        // 如果无法静态评估，检查回调参数是否是变量或包含污点
-                        // 对于混淆的代码，回调参数可能是变量（如 $ch）或包含污点的表达式（如 $ch."ert"）
-                        if (callback_arg->tainted == 1) {
-                          has_suspicious_callback = true;
-                          printf("检测到可疑回调函数参数（污点）: %s 的回调参数被标记为污点\n", Z_STRVAL_P(zv));
-                        } else if (callback_arg->kind == ZEND_AST_VAR) {
-                          // 回调参数是变量，检查是否是污点变量
+                      }
+                      
+                      // 无论评估结果如何，都要检查回调参数是否是变量
+                      // 因为变量可能通过位运算赋值，但评估时可能只评估到了部分表达式
+                      if (callback_arg && callback_arg->kind == ZEND_AST_VAR) {
+                          // 回调参数是变量，检查是否是污点变量或包含位运算赋值
                           zend_ast *var_name_node = callback_arg->child[0];
                           if (var_name_node && var_name_node->kind == ZEND_AST_ZVAL) {
                             zval *var_zv = zend_ast_get_zval(var_name_node);
                             if (var_zv && Z_TYPE_P(var_zv) == IS_STRING) {
                               zend_string *var_name = zend_ast_get_str(var_name_node);
-                              if (zend_hash_exists(&tainted_table, var_name) || 
-                                  zend_hash_exists(&var_source_table, var_name)) {
-                                has_suspicious_callback = true;
+                              bool is_tainted_var = (zend_hash_exists(&tainted_table, var_name) || 
+                                                     zend_hash_exists(&var_source_table, var_name));
+                              // 检查变量是否在赋值时使用了位运算（通过检查变量是否被标记为需要动态解析）
+                              bool has_bitwise_assignment = false;
+                              if (callback_arg->tainted & AST_NEED_DYNAMIC_RESOLVE) {
+                                has_bitwise_assignment = true;
+                                printf("DEBUG: 回调参数变量 $%s 被标记为需要动态解析（可能包含位运算）\n", Z_STRVAL_P(var_zv));
+                              } else if (g_root_ast) {
+                                // 遍历 AST 查找该变量的赋值语句，检查是否包含位运算
+                                // 这是一个简化的检查：如果变量无法静态评估，可能是混淆的
+                                zval *var_val = zend_hash_find(&var_value_table, var_name);
+                                if (!var_val) {
+                                  // 变量无法静态评估，可能是混淆的
+                                  has_bitwise_assignment = true;
+                                  printf("DEBUG: 回调参数变量 $%s 无法静态评估（可能包含位运算）\n", Z_STRVAL_P(var_zv));
+                                }
+                              }
+                              
+                              // 对于回调函数参数，变量本身就很可疑（通常用于混淆）
+                              // 即使不是污点变量且没有位运算，变量作为回调函数参数也很可疑
+                              has_suspicious_callback = true;
+                              if (is_tainted_var) {
                                 printf("检测到可疑回调函数参数（污点变量）: %s 的回调参数是污点变量 $%s\n", 
-                                       Z_STRVAL_P(zv), Z_STRVAL_P(var_zv));
+                                       func_name_for_callback ? ZSTR_VAL(func_name_for_callback) : "unknown", Z_STRVAL_P(var_zv));
+                              } else if (has_bitwise_assignment) {
+                                printf("检测到可疑回调函数参数（位运算变量）: %s 的回调参数是变量 $%s，且该变量可能通过位运算赋值（混淆代码）\n", 
+                                       func_name_for_callback ? ZSTR_VAL(func_name_for_callback) : "unknown", Z_STRVAL_P(var_zv));
+                              } else {
+                                printf("检测到可疑回调函数参数（变量）: %s 的回调参数是变量 $%s，可能是混淆代码\n", 
+                                       func_name_for_callback ? ZSTR_VAL(func_name_for_callback) : "unknown", Z_STRVAL_P(var_zv));
                               }
                             }
-                          }
-                        } else if (callback_arg->kind == ZEND_AST_BINARY_OP) {
-                          // 回调参数是二元操作（如字符串拼接），检查是否包含污点变量
-                          // 例如：$ch."ert" 其中 $ch 是污点变量
-                          zend_ast *left = callback_arg->child[0];
-                          zend_ast *right = callback_arg->child[1];
-                          bool has_tainted_operand = false;
-                          
-                          // 检查左操作数
-                          if (left && (left->tainted == 1 || 
-                              (left->kind == ZEND_AST_VAR && left->child[0] && 
-                               left->child[0]->kind == ZEND_AST_ZVAL))) {
-                            if (left->kind == ZEND_AST_VAR) {
-                              zend_ast *var_name_node = left->child[0];
-                              if (var_name_node && var_name_node->kind == ZEND_AST_ZVAL) {
-                                zval *var_zv = zend_ast_get_zval(var_name_node);
-                                if (var_zv && Z_TYPE_P(var_zv) == IS_STRING) {
-                                  zend_string *var_name = zend_ast_get_str(var_name_node);
-                                  if (zend_hash_exists(&tainted_table, var_name) || 
-                                      zend_hash_exists(&var_source_table, var_name)) {
-                                    has_tainted_operand = true;
-                                  }
-                                }
-                              }
-                            } else if (left->tainted == 1) {
-                              has_tainted_operand = true;
-                            }
-                          }
-                          
-                          // 检查右操作数
-                          if (!has_tainted_operand && right && (right->tainted == 1 || 
-                              (right->kind == ZEND_AST_VAR && right->child[0] && 
-                               right->child[0]->kind == ZEND_AST_ZVAL))) {
-                            if (right->kind == ZEND_AST_VAR) {
-                              zend_ast *var_name_node = right->child[0];
-                              if (var_name_node && var_name_node->kind == ZEND_AST_ZVAL) {
-                                zval *var_zv = zend_ast_get_zval(var_name_node);
-                                if (var_zv && Z_TYPE_P(var_zv) == IS_STRING) {
-                                  zend_string *var_name = zend_ast_get_str(var_name_node);
-                                  if (zend_hash_exists(&tainted_table, var_name) || 
-                                      zend_hash_exists(&var_source_table, var_name)) {
-                                    has_tainted_operand = true;
-                                  }
-                                }
-                              }
-                            } else if (right->tainted == 1) {
-                              has_tainted_operand = true;
-                            }
-                          }
-                          
-                          if (has_tainted_operand) {
-                            has_suspicious_callback = true;
-                            printf("检测到可疑回调函数参数（字符串拼接包含污点变量）: %s 的回调参数是字符串拼接，且包含污点变量\n", 
-                                   Z_STRVAL_P(zv));
-                          } else {
-                            // 即使不包含污点变量，字符串拼接作为回调函数参数也很可疑（通常用于混淆）
-                            has_suspicious_callback = true;
-                            printf("检测到可疑回调函数参数（字符串拼接）: %s 的回调参数是字符串拼接，可能是混淆代码\n", 
-                                   Z_STRVAL_P(zv));
                           }
                         } else if (callback_arg->kind == ZEND_AST_DIM) {
                           // 回调参数是数组访问，可能是混淆的
                           has_suspicious_callback = true;
                           printf("检测到可疑回调函数参数（数组访问）: %s 的回调参数是数组访问，可能是混淆代码\n", 
-                                 Z_STRVAL_P(zv));
+                                 func_name_for_callback ? ZSTR_VAL(func_name_for_callback) : "unknown");
                         }
                       }
                     }
@@ -2393,7 +2411,7 @@ static void webshell_check(zend_ast *ast, bool local) {
             // 改进：对于 fopen，如果第一个参数（文件路径）是污点，应该检测（特别是写模式 "w", "w+", "a", "a+"）
             // 或者如果是写模式，即使路径不是污点也应该检测（更宽松的策略）
             bool is_dangerous_fopen = false;
-            if (func_name && ZSTR_LEN(func_name) == 5 && memcmp(ZSTR_VAL(func_name), "fopen", 5) == 0) {
+            if (func_name_for_callback && ZSTR_LEN(func_name_for_callback) == 5 && memcmp(ZSTR_VAL(func_name_for_callback), "fopen", 5) == 0) {
               printf("DEBUG: 检测到 fopen 调用，开始分析参数...\n");
               zend_ast **children = ast_get_children(current, &count);
               printf("DEBUG: fopen 子节点数量: %u\n", count);
@@ -2440,7 +2458,7 @@ static void webshell_check(zend_ast *ast, bool local) {
             // 或者如果数据是变量或函数调用，也应该检测（更宽松的策略）
             // 最宽松的策略：fwrite 调用本身就应该被视为可疑（因为写入文件本身就是危险的）
             bool is_dangerous_fwrite = false;
-            if (func_name && ZSTR_LEN(func_name) == 6 && memcmp(ZSTR_VAL(func_name), "fwrite", 6) == 0) {
+            if (func_name_for_callback && ZSTR_LEN(func_name_for_callback) == 6 && memcmp(ZSTR_VAL(func_name_for_callback), "fwrite", 6) == 0) {
               printf("DEBUG: 检测到 fwrite 调用，开始分析参数...\n");
               zend_ast **children = ast_get_children(current, &count);
               printf("DEBUG: fwrite 子节点数量: %u\n", count);
@@ -2486,7 +2504,7 @@ static void webshell_check(zend_ast *ast, bool local) {
             if (has_dangerous_regex) {
               should_detect = true;
               printf("DEBUG: 通过危险正则表达式/修饰符检测触发 (func_name=%s, has_dangerous_regex=%d)\n", 
-                     Z_STRVAL_P(zv), has_dangerous_regex);
+                     func_name_for_callback ? ZSTR_VAL(func_name_for_callback) : "unknown", has_dangerous_regex);
             } else if (has_dangerous_callback || has_suspicious_callback || has_hex_encoded_danger) {
               should_detect = true;
               printf("DEBUG: 通过其他检测条件触发 (has_dangerous_callback=%d, has_suspicious_callback=%d, has_hex_encoded_danger=%d)\n",
@@ -2497,11 +2515,12 @@ static void webshell_check(zend_ast *ast, bool local) {
               if (has_suspicious_callback || has_dangerous_callback) {
                 // 检查是否是接受回调函数的函数
                 bool is_callback_func = false;
-                if (func_name) {
-                  const char *func_name_str = ZSTR_VAL(func_name);
-                  size_t func_name_len = ZSTR_LEN(func_name);
+                if (func_name_for_callback) {
+                  const char *func_name_str = ZSTR_VAL(func_name_for_callback);
+                  size_t func_name_len = ZSTR_LEN(func_name_for_callback);
                   // 常见的接受回调函数的函数
                   if ((func_name_len == 20 && memcmp(func_name_str, "array_intersect_ukey", 20) == 0) ||
+                      (func_name_len == 22 && memcmp(func_name_str, "array_intersect_uassoc", 22) == 0) ||
                       (func_name_len == 11 && memcmp(func_name_str, "array_filter", 11) == 0) ||
                       (func_name_len == 8 && memcmp(func_name_str, "array_map", 8) == 0) ||
                       (func_name_len == 12 && memcmp(func_name_str, "array_walk", 12) == 0) ||
@@ -2521,21 +2540,21 @@ static void webshell_check(zend_ast *ast, bool local) {
             }
             // 最优先：检查是否是文件操作函数（fopen, fwrite, file_put_contents）
             else {
-              bool is_file_op = (func_name && (
-                (ZSTR_LEN(func_name) == 5 && memcmp(ZSTR_VAL(func_name), "fopen", 5) == 0) ||
-                (ZSTR_LEN(func_name) == 6 && memcmp(ZSTR_VAL(func_name), "fwrite", 6) == 0) ||
-                (ZSTR_LEN(func_name) == 11 && memcmp(ZSTR_VAL(func_name), "file_put_contents", 11) == 0)
+              bool is_file_op = (func_name_for_callback && (
+                (ZSTR_LEN(func_name_for_callback) == 5 && memcmp(ZSTR_VAL(func_name_for_callback), "fopen", 5) == 0) ||
+                (ZSTR_LEN(func_name_for_callback) == 6 && memcmp(ZSTR_VAL(func_name_for_callback), "fwrite", 6) == 0) ||
+                (ZSTR_LEN(func_name_for_callback) == 11 && memcmp(ZSTR_VAL(func_name_for_callback), "file_put_contents", 11) == 0)
               ));
               if (is_file_op) {
                 // 对于文件操作函数，无论参数是否污点，都应该检测（最宽松的策略）
                 should_detect = true;
                 printf("DEBUG: 通过文件操作函数检测触发 (func_name=%s, is_dangerous_fopen=%d, is_dangerous_fwrite=%d)\n", 
-                       Z_STRVAL_P(zv), is_dangerous_fopen, is_dangerous_fwrite);
+                       func_name_for_callback ? ZSTR_VAL(func_name_for_callback) : "unknown", is_dangerous_fopen, is_dangerous_fwrite);
               } else if (is_dangerous_fopen || is_dangerous_fwrite) {
                 should_detect = true;
                 printf("DEBUG: 通过 fopen/fwrite 检测触发 (is_dangerous_fopen=%d, is_dangerous_fwrite=%d)\n", 
                        is_dangerous_fopen, is_dangerous_fwrite);
-              } else if (zend_hash_exists(&sink_table, func_name)) {
+              } else if (func_name_for_callback && zend_hash_exists(&sink_table, func_name_for_callback)) {
                 // 对于 sink_table 中的函数，如果参数是污点，应该检测
                 // 改进：对于 preg_replace，即使参数不是污点，如果包含 /e 修饰符，也应该检测
                 // 改进：对于 assert/eval 等危险函数，即使参数不是污点，如果参数是变量，也应该检测
@@ -2544,18 +2563,18 @@ static void webshell_check(zend_ast *ast, bool local) {
                 // 改进：对于 move_uploaded_file，即使参数不是污点，如果第一个参数是变量，也应该检测（因为文件上传操作本身就是危险的）
                 bool has_var_arg = false;
                 bool is_move_uploaded_file = false;
-                if (func_name && ZSTR_LEN(func_name) == 18 && 
-                    memcmp(ZSTR_VAL(func_name), "move_uploaded_file", 18) == 0) {
+                if (func_name_for_callback && ZSTR_LEN(func_name_for_callback) == 18 && 
+                    memcmp(ZSTR_VAL(func_name_for_callback), "move_uploaded_file", 18) == 0) {
                   is_move_uploaded_file = true;
                 }
                 bool has_call_arg = false;
                 bool is_cmd_exec_func = false;
                 // 检查是否是命令执行函数
-                if (func_name && (
-                    (ZSTR_LEN(func_name) == 8 && memcmp(ZSTR_VAL(func_name), "passthru", 8) == 0) ||
-                    (ZSTR_LEN(func_name) == 4 && memcmp(ZSTR_VAL(func_name), "exec", 4) == 0) ||
-                    (ZSTR_LEN(func_name) == 6 && memcmp(ZSTR_VAL(func_name), "system", 6) == 0) ||
-                    (ZSTR_LEN(func_name) == 10 && memcmp(ZSTR_VAL(func_name), "shell_exec", 10) == 0))) {
+                if (func_name_for_callback && (
+                    (ZSTR_LEN(func_name_for_callback) == 8 && memcmp(ZSTR_VAL(func_name_for_callback), "passthru", 8) == 0) ||
+                    (ZSTR_LEN(func_name_for_callback) == 4 && memcmp(ZSTR_VAL(func_name_for_callback), "exec", 4) == 0) ||
+                    (ZSTR_LEN(func_name_for_callback) == 6 && memcmp(ZSTR_VAL(func_name_for_callback), "system", 6) == 0) ||
+                    (ZSTR_LEN(func_name_for_callback) == 10 && memcmp(ZSTR_VAL(func_name_for_callback), "shell_exec", 10) == 0))) {
                   is_cmd_exec_func = true;
                 }
                 // 重新获取 args，因为可能不在之前的作用域内
@@ -2612,33 +2631,33 @@ static void webshell_check(zend_ast *ast, bool local) {
                 }
                 
                 if (has_tainted_arg || 
-                    (has_dangerous_regex && ZSTR_LEN(func_name) == 12 && 
-                     memcmp(ZSTR_VAL(func_name), "preg_replace", 12) == 0) ||
-                    (has_var_arg && (ZSTR_LEN(func_name) == 6 && memcmp(ZSTR_VAL(func_name), "assert", 6) == 0) ||
-                                    (ZSTR_LEN(func_name) == 4 && memcmp(ZSTR_VAL(func_name), "eval", 4) == 0)) ||
+                    (has_dangerous_regex && func_name_for_callback && ZSTR_LEN(func_name_for_callback) == 12 && 
+                     memcmp(ZSTR_VAL(func_name_for_callback), "preg_replace", 12) == 0) ||
+                    (has_var_arg && func_name_for_callback && ((ZSTR_LEN(func_name_for_callback) == 6 && memcmp(ZSTR_VAL(func_name_for_callback), "assert", 6) == 0) ||
+                                    (ZSTR_LEN(func_name_for_callback) == 4 && memcmp(ZSTR_VAL(func_name_for_callback), "eval", 4) == 0))) ||
                     (is_cmd_exec_func && has_call_arg) ||
                     (is_move_uploaded_file && move_uploaded_file_has_var_first_arg)) {
                   should_detect = true;
                   printf("DEBUG: 通过 sink_table 检测触发 (func_name=%s, has_tainted_arg=%d, has_dangerous_regex=%d, has_var_arg=%d, is_cmd_exec_func=%d, has_call_arg=%d, is_move_uploaded_file=%d, move_uploaded_file_has_var_first_arg=%d)\n", 
-                         Z_STRVAL_P(zv), has_tainted_arg, has_dangerous_regex, has_var_arg, is_cmd_exec_func, has_call_arg, is_move_uploaded_file, move_uploaded_file_has_var_first_arg);
+                         func_name_for_callback ? ZSTR_VAL(func_name_for_callback) : "unknown", has_tainted_arg, has_dangerous_regex, has_var_arg, is_cmd_exec_func, has_call_arg, is_move_uploaded_file, move_uploaded_file_has_var_first_arg);
                 }
-              } else if (zend_hash_exists(&webshell_table, func_name)) {
+              } else if (func_name_for_callback && zend_hash_exists(&webshell_table, func_name_for_callback)) {
                 should_detect = true;
-                printf("DEBUG: 通过 webshell_table 检测触发 (func_name=%s)\n", Z_STRVAL_P(zv));
-              } else if ((zend_hash_exists(&sink_func_table, func_name)) && has_tainted_arg) {
+                printf("DEBUG: 通过 webshell_table 检测触发 (func_name=%s)\n", ZSTR_VAL(func_name_for_callback));
+              } else if (func_name_for_callback && (zend_hash_exists(&sink_func_table, func_name_for_callback)) && has_tainted_arg) {
                 should_detect = true;
                 printf("DEBUG: 通过 sink_func_table 检测触发 (func_name=%s, has_tainted_arg=%d)\n", 
-                       Z_STRVAL_P(zv), has_tainted_arg);
+                       ZSTR_VAL(func_name_for_callback), has_tainted_arg);
               }
             }
             
             if (should_detect) {
               printf("检测到危险函数调用: %s (sink_table=%d, has_tainted_arg=%d, webshell_table=%d, sink_func_table=%d, has_dangerous_callback=%d, has_suspicious_callback=%d, has_dangerous_regex=%d, has_hex_encoded_danger=%d, is_dangerous_fopen=%d, is_dangerous_fwrite=%d)\n", 
-                     Z_STRVAL_P(zv), 
-                     zend_hash_exists(&sink_table, func_name),
+                     func_name_for_callback ? ZSTR_VAL(func_name_for_callback) : "unknown", 
+                     func_name_for_callback ? zend_hash_exists(&sink_table, func_name_for_callback) : 0,
                      has_tainted_arg,
-                     zend_hash_exists(&webshell_table, func_name),
-                     zend_hash_exists(&sink_func_table, func_name),
+                     func_name_for_callback ? zend_hash_exists(&webshell_table, func_name_for_callback) : 0,
+                     func_name_for_callback ? zend_hash_exists(&sink_func_table, func_name_for_callback) : 0,
                      has_dangerous_callback,
                      has_suspicious_callback,
                      has_dangerous_regex,
@@ -3118,7 +3137,6 @@ static void webshell_check(zend_ast *ast, bool local) {
         }
       }
 
-    }
       zend_ast **ast_child = ast_get_children(current,&count);
       
       // 调试：输出当前节点的子节点信息
@@ -6281,7 +6299,7 @@ int main(int argc, char *argv[]) {
             (strstr(ZSTR_VAL(code), "shell_exec(") != NULL && (strstr(ZSTR_VAL(code), "$_GET") != NULL || strstr(ZSTR_VAL(code), "$_POST") != NULL || strstr(ZSTR_VAL(code), "$_REQUEST") != NULL)) ||
             (strstr(ZSTR_VAL(code), "passthru(") != NULL && (strstr(ZSTR_VAL(code), "$_GET") != NULL || strstr(ZSTR_VAL(code), "$_POST") != NULL || strstr(ZSTR_VAL(code), "$_REQUEST") != NULL))) {
           has_string_dangerous_call = true;
-          printf("DEBUG: 在源代码中发现字符串中包含危险函数调用模式（如 system(\$_GET[...])）\n");
+          printf("DEBUG: 在源代码中发现字符串中包含危险函数调用模式（如 system($_GET[...])）\n");
         }
         
         // 检查SQL注入特征（INTO OUTFILE）
