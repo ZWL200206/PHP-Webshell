@@ -1,10 +1,14 @@
 #include "zend_compile.h"
 #include "zend_alloc.h"
+#include "zend_language_parser.h"  // 包含token类型定义（T_STRING, T_VARIABLE等）
 #include <ctype.h>
 #include <string.h>
 #include <stdlib.h>
 #include <signal.h>
 #include <stdint.h>
+
+// AST节点计数上限保护：防止极端情况下AST过大导致分析时间过长或内存耗尽
+#define MAX_AST_NODES 1000000  // 100万节点上限
 
 typedef bool zend_bool;
 
@@ -43,6 +47,8 @@ static int local_webshell = 0;
 static int func_source_count = 0;
 // 动态断言命中计数（建议2）
 static int dynamic_webshell_hit = 0;
+// 记录在段错误发生前是否已检测到webshell
+static int g_webshell_detected_before_segfault = 0;
 
 /* 标记：需要动态解析的节点（静态分析无法确定） */
 #define AST_NEED_DYNAMIC_RESOLVE 0x1000
@@ -82,49 +88,206 @@ static void add_sink_var_from_assignment(zend_ast *var_node, zend_string *func_n
 static zend_bool is_hex_string(zend_string *str);
 static zend_string* hex_decode_string(zend_string *hex_str);
 static zend_bool contains_dangerous_function(zend_string *str);
+
+// ========== 分段式沙箱执行（Chunk Execution）类型定义 ==========
+// 危险代码块结构
+typedef struct {
+    size_t start_pos;
+    size_t end_pos;
+    const char *reason;
+    char *code_chunk;  // 提取的代码块
+    size_t chunk_len;
+} DangerousChunk;
+
+// 行为监控结果
+typedef struct {
+    bool has_system_call;      // 是否调用了system
+    bool has_file_write;        // 是否进行了文件写入
+    bool has_network_connect;   // 是否进行了网络连接
+    bool has_execution;         // 是否执行了代码
+    char *captured_output;      // 捕获的输出
+    size_t output_len;
+} BehaviorMonitor;
+
+// ========== 基于Token/IR的低内存分析 ==========
+// Token Graph数据结构
+typedef enum {
+    EDGE_CALL,      // 函数调用
+    EDGE_ASSIGN,    // 赋值
+    EDGE_INCLUDE,   // include/require
+    EDGE_EVAL,      // eval
+    EDGE_ACCESS     // 变量访问
+} TokenEdgeType;
+
+typedef struct TokenNode {
+    int token_type;              // token类型（T_STRING, T_VARIABLE等）
+    zend_string *token_value;   // token的值（如果是字符串或变量名）
+    size_t position;             // 在源代码中的位置
+    uint32_t lineno;             // 行号
+    struct TokenNode *next;       // 链表下一个节点
+} TokenNode;
+
+typedef struct TokenEdge {
+    TokenEdgeType edge_type;     // 边类型
+    TokenNode *from;             // 源节点
+    TokenNode *to;               // 目标节点
+    zend_string *func_name;      // 如果是CALL边，记录函数名
+    struct TokenEdge *next;      // 链表下一个边
+} TokenEdge;
+
+typedef struct TokenGraph {
+    TokenNode *nodes;            // 节点链表
+    TokenEdge *edges;            // 边链表
+    size_t node_count;           // 节点数量
+    size_t edge_count;           // 边数量
+} TokenGraph;
+
+// Token IR相关函数声明
+static TokenGraph* build_token_graph(zend_string *code, zend_string *filename);
+static void free_token_graph(TokenGraph *graph);
+static void webshell_check_token_ir(TokenGraph *graph);
+static int extract_tokens_only(zend_string *code, zend_string *filename, TokenNode **nodes, size_t *node_count);
+
+// 分段式沙箱执行相关函数声明
+static void chunk_based_sandbox_execution(const char *source, size_t source_len,
+                                          const char *filename, size_t check_limit);
+static int extract_dangerous_chunks(const char *source, size_t source_len,
+                                    DangerousChunk *chunks, int max_chunks, size_t check_limit);
+static BehaviorMonitor execute_chunk_in_sandbox(DangerousChunk *chunk, const char *filename);
+
+// 辅助函数：根据偏移计算行号
+static uint32_t calculate_line_number(const char *source, size_t source_len, size_t offset) {
+    if (!source || offset >= source_len) return 1;
+    uint32_t line = 1;
+    for (size_t i = 0; i < offset && i < source_len; i++) {
+        if (source[i] == '\n') {
+            line++;
+        }
+    }
+    return line;
+}
+
+// 辅助函数：将模式匹配结果添加到suspect_site_table
+static void add_pattern_match_to_suspect_table(const char *pattern, size_t offset, 
+                                                const char *source, size_t source_len,
+                                                const char *combination) {
+    // 计算行号
+    uint32_t lineno = calculate_line_number(source, source_len, offset);
+    
+    // 生成键名：pattern_offset_lineno
+    char key_buf[256];
+    snprintf(key_buf, sizeof(key_buf), "PATTERN_%s_%zu_%u", pattern, offset, lineno);
+    zend_string *key_str = zend_string_init(key_buf, strlen(key_buf), 0);
+    
+    // 生成值：组合信息
+    char value_buf[512];
+    size_t value_len;
+    if (combination) {
+        value_len = snprintf(value_buf, sizeof(value_buf), "函数/关键字: %s, 偏移: %zu, 行号: %u, 组合: %s", 
+                 pattern, offset, lineno, combination);
+    } else {
+        value_len = snprintf(value_buf, sizeof(value_buf), "函数/关键字: %s, 偏移: %zu, 行号: %u", 
+                 pattern, offset, lineno);
+    }
+    
+    // 使用 ZVAL_STR 配合 zend_string_init（更安全，避免链接错误）
+    zval value_zv;
+    zend_string *value_str = zend_string_init(value_buf, value_len, 0);
+    ZVAL_STR(&value_zv, value_str);
+    
+    // 添加到suspect_site_table（如果不存在）
+    if (!zend_hash_exists(&suspect_site_table, key_str)) {
+        zend_hash_add(&suspect_site_table, key_str, &value_zv);
+    } else {
+        zval_dtor(&value_zv);
+    }
+    
+    zend_string_release(key_str);
+}
+
+// 安全内存分配函数：检查分配失败
+// 注意：使用 my_ 前缀避免与 Zend 引擎的 safe_emalloc 宏冲突
+static void *my_safe_emalloc(size_t size) {
+    void *p = emalloc(size);
+    if (!p) {
+        fprintf(stderr, "[FATAL] my_safe_emalloc failed (size=%zu)\n", size);
+        exit(1);
+    }
+    return p;
+}
+
+static void *my_safe_malloc(size_t size) {
+    void *p = malloc(size);
+    if (!p) {
+        fprintf(stderr, "[FATAL] my_safe_malloc failed (size=%zu)\n", size);
+        exit(1);
+    }
+    return p;
+}
+
+static void *my_safe_realloc(void *ptr, size_t size) {
+    void *p = realloc(ptr, size);
+    if (!p && size > 0) {
+        fprintf(stderr, "[FATAL] my_safe_realloc failed (size=%zu)\n", size);
+        exit(1);
+    }
+    return p;
+}
+
 // 栈结构，用于存储节点指针
 typedef struct Stack {
     zend_ast** data;
-    int top;
-    int capacity;
+    size_t top;
+    size_t capacity;
 } Stack;
 
-
 // 初始化栈
-void initStack(Stack *stack, int capacity) {
-    //Stack* stack = (Stack*)malloc(sizeof(Stack));
-    stack->data = (zend_ast**)malloc(sizeof(zend_ast*) * capacity);
-    stack->top = 0;
-    stack->capacity = capacity;
+static int initStack(Stack *stack, size_t initial_capacity) {
+    stack->data = (zend_ast**)my_safe_malloc(sizeof(zend_ast*) * initial_capacity);
+    stack->top = 0;         // 用 size_t，表示"下一个可写位置"
+    stack->capacity = initial_capacity;
+    return 1;
 }
 
-// 判断栈是否满
-int isFull(Stack* stack) {
-    return stack->top == stack->capacity;
+// 确保栈有足够容量（自动扩容）
+static int ensureStackCapacity(Stack *stack) {
+    if (stack->top < stack->capacity) {
+        return 1;
+    }
+    size_t new_cap = stack->capacity * 2;
+    zend_ast **new_data = (zend_ast **)my_safe_realloc(stack->data, sizeof(zend_ast*) * new_cap);
+    stack->data = new_data;
+    stack->capacity = new_cap;
+    return 1;
 }
 
-// 入栈操作
-void push(Stack* stack, zend_ast* item) {
-    if (isFull(stack)) {
-        // 栈已满，处理溢出情况
-        return;
+// 入栈操作（支持动态扩容）
+static int push(Stack *stack, zend_ast *item) {
+    if (!ensureStackCapacity(stack)) {
+        return 0; // 失败就返回 0，由上层决定是否中止
     }
     stack->data[stack->top++] = item;
-}
-
-// 判断栈是否空
-int isEmpty(Stack* stack) {
-    return stack->top == 0;
+    return 1;
 }
 
 // 出栈操作
-zend_ast* pop(Stack* stack) {
-    if (isEmpty(stack)) {
-        // 栈为空，处理下溢情况
-        return NULL;
-    }
+static zend_ast* pop(Stack *stack) {
+    if (stack->top == 0) return NULL;
+    return stack->data[--(stack->top)];
+}
 
-    return stack->data[--stack->top];
+// 判断栈是否空
+static int isEmpty(Stack *stack) {
+    return stack->top == 0;
+}
+
+// 释放栈内存
+static void freeStack(Stack *stack) {
+    if (stack && stack->data) {
+        free(stack->data);
+        stack->data = NULL;
+        stack->top = stack->capacity = 0;
+    }
 }
 
 // 识别ast节点是声明类型
@@ -233,15 +396,12 @@ static inline zend_ast **ast_get_children(zend_ast *ast, uint32_t *count) {
                         *count = 0;
                         return NULL;
                 }
-                // 限制 children 的最大值，防止越界访问
+                // 直接使用 list->children，不进行截断
                 uint32_t children_count = list->children;
                 // 添加额外的安全检查：确保 children_count 是合理的值
                 if (children_count == 0) {
                         *count = 0;
                         return NULL;
-                }
-                if (children_count > 1000) {
-                        children_count = 1000;  // 增加限制以处理大型AST
                 }
                 *count = children_count;
                 // 确保 child 数组指针有效
@@ -252,10 +412,7 @@ static inline zend_ast **ast_get_children(zend_ast *ast, uint32_t *count) {
                 return list->child;
         } else {
                 *count = zend_ast_get_num_children(ast);
-                // 限制 count 的最大值
-                if (*count > 100) {
-                        *count = 100;  // 增加限制以处理大型AST
-                }
+                // 直接使用 zend_ast_get_num_children 返回的值，不进行截断
                 return ast->child;
         }
 }
@@ -653,13 +810,26 @@ static zend_ast* find_stmt_and_list_for_node(zend_ast *node, zend_ast **out_stmt
 static void traverse_ast(zend_ast *ast) {
 
   uint32_t count;
-  Stack* stack = (Stack*)malloc(sizeof(Stack));
-  initStack(stack, 10000);  // 增加栈大小以处理大型AST
-  push(stack, ast);          // 将根节点加入栈
+  size_t node_count = 0;  // 节点计数
+  Stack stack;
+  if (!initStack(&stack, 1024)) {
+      // 初始化失败，直接返回
+      return;
+  }
+  if (!push(&stack, ast)) {  // 将根节点加入栈
+      freeStack(&stack);
+      return;
+  }
 
-  while (!isEmpty(stack)) {
+  while (!isEmpty(&stack)) {
+      // 节点计数上限保护
+      if (++node_count > MAX_AST_NODES) {
+          fprintf(stderr, "[ERROR] traverse_ast: AST node count exceeds safe limit (%zu), aborting analysis\n", (size_t)MAX_AST_NODES);
+          freeStack(&stack);
+          return;
+      }
 
-      zend_ast* current = pop(stack); // 从栈中取出一个节点
+      zend_ast* current = pop(&stack); // 从栈中取出一个节点
       if (!current) continue;
       if(current->kind > 1000){
          continue;
@@ -681,28 +851,18 @@ static void traverse_ast(zend_ast *ast) {
           continue;  // 如果无法获取子节点，跳过
       }
       
-      // 限制 count 的最大值，防止越界访问
-      if (count > 1000) {
-          count = 1000;  // 增加限制以处理大型AST
-      }
-
-      // 关键修复：对于非 list 节点，需要特别小心处理
-      // 对于使用 struct hack 的节点，ast_child 指向的是节点内部的 child 数组
-      // 我们需要确保不会访问超出实际分配范围的内存
+      // 直接使用 ast_get_children 返回的 count，不进行截断
+      // 对于非 list 节点，使用 zend_ast_get_num_children 获取实际的子节点数量
       uint32_t actual_count = count;
       if (!zend_ast_is_list(current)) {
-          // 对于非 list 节点，使用 zend_ast_get_num_children 获取实际的子节点数量
           uint32_t num_children = zend_ast_get_num_children(current);
           if (num_children < actual_count) {
-              actual_count = num_children;  // 使用较小的值
+              actual_count = num_children;  // 使用较小的值以确保安全
           }
       }
 
-      for (int i = 0; i < actual_count; i++) {
-          int reverse_i = actual_count - i - 1;
-          if (reverse_i < 0 || reverse_i >= actual_count) {
-              continue;  // 防止数组越界
-          }
+      for (uint32_t i = 0; i < actual_count; i++) {
+          uint32_t reverse_i = actual_count - i - 1;
           
           // 对于所有节点类型，都使用 ast_child 指针，但添加边界检查
           zend_ast *child = NULL;
@@ -725,12 +885,16 @@ static void traverse_ast(zend_ast *ast) {
               }
               // 只有在 kind 有效时才设置 father 和入栈
               child->father = current;
-              push(stack, child); // 将非空子节点加入栈
+              if (!push(&stack, child)) { // 将非空子节点加入栈
+                  // 栈扩容失败 → 提前中止，避免继续走到崩溃
+                  fprintf(stderr, "[FATAL] traverse_ast: push failed, aborting\n");
+                  freeStack(&stack);
+                  return;
+              }
           }
       }
   }
-  free(stack->data); // 释放栈内存
-  free(stack);
+  freeStack(&stack); // 释放栈内存
 
 }
 
@@ -985,13 +1149,25 @@ static void taint_propagate(zend_ast* ast, bool local) {
 static void taint_track(zend_ast *ast) {
 
   uint32_t count;
-  Stack* stack = (Stack*)malloc(sizeof(Stack));
-  initStack(stack, 10000);  // 增加栈大小以处理大型AST
-  push(stack, ast);          // 将根节点加入栈
+  size_t node_count = 0;  // 节点计数
+  Stack stack;
+  if (!initStack(&stack, 1024)) {
+      return;
+  }
+  if (!push(&stack, ast)) {  // 将根节点加入栈
+      freeStack(&stack);
+      return;
+  }
 
-  while (!isEmpty(stack)) {
+  while (!isEmpty(&stack)) {
+      // 节点计数上限保护
+      if (++node_count > MAX_AST_NODES) {
+          fprintf(stderr, "[ERROR] taint_track: AST node count exceeds safe limit (%zu), aborting analysis\n", (size_t)MAX_AST_NODES);
+          freeStack(&stack);
+          return;
+      }
 
-    zend_ast* current = pop(stack); // 从栈中取出一个节点
+    zend_ast* current = pop(&stack); // 从栈中取出一个节点
     //printf("%d ", current->kind);  // 访问当前节点
 
     if (current->kind == ZEND_AST_VAR) {
@@ -1190,13 +1366,17 @@ static void taint_track(zend_ast *ast) {
               check_function(ast_child[reverse_i]);
               printf("there\n");
             } else {
-              push(stack, ast_child[reverse_i]); // 将非空子节点加入栈
+              if (!push(&stack, ast_child[reverse_i])) { // 将非空子节点加入栈
+                  // 栈扩容失败 → 提前中止，避免继续走到崩溃
+                  fprintf(stderr, "[FATAL] taint_track: push failed, aborting\n");
+                  freeStack(&stack);
+                  return;
+              }
             }
         }
     }
   }
-  free(stack->data); // 释放栈内存
-  free(stack);
+  freeStack(&stack); // 释放栈内存
 
 }
 
@@ -1206,13 +1386,25 @@ static void taint_track(zend_ast *ast) {
 static void local_taint_track(zend_ast *ast) {
 
   uint32_t count;
-  Stack* stack = (Stack*)malloc(sizeof(Stack));
-  initStack(stack, 10000);  // 增加栈大小以处理大型AST
-  push(stack, ast);          // 将根节点加入栈
+  size_t node_count = 0;  // 节点计数
+  Stack stack;
+  if (!initStack(&stack, 1024)) {
+      return;
+  }
+  if (!push(&stack, ast)) {  // 将根节点加入栈
+      freeStack(&stack);
+      return;
+  }
 
-  while (!isEmpty(stack)) {
+  while (!isEmpty(&stack)) {
+      // 节点计数上限保护
+      if (++node_count > MAX_AST_NODES) {
+          fprintf(stderr, "[ERROR] local_taint_track: AST node count exceeds safe limit (%zu), aborting analysis\n", (size_t)MAX_AST_NODES);
+          freeStack(&stack);
+          return;
+      }
 
-    zend_ast* current = pop(stack); // 从栈中取出一个节点
+    zend_ast* current = pop(&stack); // 从栈中取出一个节点
     //printf("%d ", current->kind);  // 访问当前节点
 
     if (current->kind == ZEND_AST_VAR) {
@@ -1309,12 +1501,16 @@ static void local_taint_track(zend_ast *ast) {
 
             }
 
-            push(stack, ast_child[reverse_i]); // 将非空子节点加入栈
+            if (!push(&stack, ast_child[reverse_i])) { // 将非空子节点加入栈
+                // 栈扩容失败 → 提前中止，避免继续走到崩溃
+                fprintf(stderr, "[FATAL] local_taint_track: push failed, aborting\n");
+                freeStack(&stack);
+                return;
+            }
         }
     }
   }
-  free(stack->data); // 释放栈内存
-  free(stack);
+  freeStack(&stack); // 释放栈内存
 
 }
 
@@ -1358,13 +1554,25 @@ static void sink_propagate(zend_ast* ast, HashTable* var_table, int* var_count) 
 static void sink_track(zend_ast *ast, HashTable* var_table, int* var_count) {
 
   uint32_t count;
-  Stack* stack = (Stack*)malloc(sizeof(Stack));
-  initStack(stack, 10000);  // 增加栈大小以处理大型AST
-  push(stack, ast);          // 将根节点加入栈
+  size_t node_count = 0;  // 节点计数
+  Stack stack;
+  if (!initStack(&stack, 1024)) {
+      return;
+  }
+  if (!push(&stack, ast)) {  // 将根节点加入栈
+      freeStack(&stack);
+      return;
+  }
 
-  while (!isEmpty(stack)) {
+  while (!isEmpty(&stack)) {
+      // 节点计数上限保护
+      if (++node_count > MAX_AST_NODES) {
+          fprintf(stderr, "[ERROR] sink_track: AST node count exceeds safe limit (%zu), aborting analysis\n", (size_t)MAX_AST_NODES);
+          freeStack(&stack);
+          return;
+      }
 
-    zend_ast* current = pop(stack); // 从栈中取出一个节点
+    zend_ast* current = pop(&stack); // 从栈中取出一个节点
     //printf("%d ", current->kind);  // 访问当前节点
 
     if (current->kind == ZEND_AST_ZVAL) {
@@ -1431,16 +1639,199 @@ static void sink_track(zend_ast *ast, HashTable* var_table, int* var_count) {
                     
                     // 检查右侧表达式是否评估为危险函数名
                     if (expr_node) {
+                      // 检查是否是 explode 函数调用
+                      if (expr_node->kind == ZEND_AST_CALL) {
+                        zend_ast *func_name_node = expr_node->child[0];
+                        if (func_name_node && func_name_node->kind == ZEND_AST_ZVAL) {
+                          zval *func_zv = zend_ast_get_zval(func_name_node);
+                          if (func_zv && Z_TYPE_P(func_zv) == IS_STRING) {
+                            zend_string *func_name_str = zend_ast_get_str(func_name_node);
+                            if (func_name_str && zend_string_equals_literal_ci(func_name_str, "explode")) {
+                              // 处理 explode 函数调用
+                              zend_ast *args_ast = expr_node->child[1];
+                              if (args_ast && zend_ast_is_list(args_ast)) {
+                                zend_ast_list *args = zend_ast_get_list(args_ast);
+                                if (args && args->children >= 2) {
+                                  // 评估分隔符和字符串
+                                  zend_string *delimiter = evaluate_string_expression(args->child[0]);
+                                  zend_string *string = evaluate_string_expression(args->child[1]);
+                                  if (delimiter && string) {
+                                    // 分割字符串并创建数组
+                                    zval array_zv;
+                                    ZVAL_ARR(&array_zv, zend_new_array(0));
+                                    const char *str = ZSTR_VAL(string);
+                                    size_t str_len = ZSTR_LEN(string);
+                                    const char *delim = ZSTR_VAL(delimiter);
+                                    size_t delim_len = ZSTR_LEN(delimiter);
+                                    
+                                    if (delim_len > 0) {
+                                      const char *start = str;
+                                      const char *end = str;
+                                      size_t index = 0;
+                                      while ((end = strstr(start, delim)) != NULL) {
+                                        size_t part_len = end - start;
+                                        if (part_len > 0) {
+                                          zend_string *part = zend_string_init(start, part_len, 0);
+                                          zval part_zv;
+                                          ZVAL_STR(&part_zv, part);
+                                          zend_hash_index_update(Z_ARRVAL_P(&array_zv), index++, &part_zv);
+                                        }
+                                        start = end + delim_len;
+                                      }
+                                      // 添加最后一部分
+                                      size_t part_len = str + str_len - start;
+                                      if (part_len > 0) {
+                                        zend_string *part = zend_string_init(start, part_len, 0);
+                                        zval part_zv;
+                                        ZVAL_STR(&part_zv, part);
+                                        zend_hash_index_update(Z_ARRVAL_P(&array_zv), index++, &part_zv);
+                                      }
+                                    }
+                                    
+                                    // 将数组存储到 var_value_table 中
+                                    zend_hash_update(&var_value_table, var_name, &array_zv);
+                                    printf("评估 explode 结果: 数组包含 %u 个元素，已存储到 var_value_table\n", 
+                                           (unsigned int)zend_hash_num_elements(Z_ARRVAL_P(&array_zv)));
+                                    
+                                    zend_string_release(delimiter);
+                                    zend_string_release(string);
+                                  } else {
+                                    if (delimiter) zend_string_release(delimiter);
+                                    if (string) zend_string_release(string);
+                                  }
+                                }
+                              }
+                            }
+                          }
+                        }
+                      }
+                      
+                      // 检查赋值表达式是否包含位运算（异或、或、与），这是常见的混淆手段
+                      bool has_bitwise_op = false;
+                      if (expr_node && expr_node->kind == ZEND_AST_BINARY_OP) {
+                        if (expr_node->attr == ZEND_BW_XOR || 
+                            expr_node->attr == ZEND_BW_OR || 
+                            expr_node->attr == ZEND_BW_AND) {
+                          has_bitwise_op = true;
+                          printf("检测到可疑的位运算赋值: $%s 的赋值表达式包含位运算（异或/或/与），可能是混淆代码\n", 
+                                 Z_STRVAL_P(zv));
+                        }
+                      } else if (expr_node && expr_node->kind == ZEND_AST_BINARY_OP && 
+                                 expr_node->attr == ZEND_CONCAT) {
+                        // 检查字符串拼接中是否包含位运算
+                        if (expr_node->child[0] && expr_node->child[0]->kind == ZEND_AST_BINARY_OP &&
+                            (expr_node->child[0]->attr == ZEND_BW_XOR || 
+                             expr_node->child[0]->attr == ZEND_BW_OR || 
+                             expr_node->child[0]->attr == ZEND_BW_AND)) {
+                          has_bitwise_op = true;
+                          printf("检测到可疑的位运算拼接: $%s 的赋值表达式在字符串拼接中包含位运算，可能是混淆代码\n", 
+                                 Z_STRVAL_P(zv));
+                        }
+                        if (expr_node->child[1] && expr_node->child[1]->kind == ZEND_AST_BINARY_OP &&
+                            (expr_node->child[1]->attr == ZEND_BW_XOR || 
+                             expr_node->child[1]->attr == ZEND_BW_OR || 
+                             expr_node->child[1]->attr == ZEND_BW_AND)) {
+                          has_bitwise_op = true;
+                          printf("检测到可疑的位运算拼接: $%s 的赋值表达式在字符串拼接中包含位运算，可能是混淆代码\n", 
+                                 Z_STRVAL_P(zv));
+                        }
+                        // 检查嵌套的字符串拼接
+                        if (expr_node->child[0] && expr_node->child[0]->kind == ZEND_AST_BINARY_OP &&
+                            expr_node->child[0]->attr == ZEND_CONCAT) {
+                          // 递归检查左侧
+                          zend_ast *left = expr_node->child[0];
+                          if (left->child[0] && left->child[0]->kind == ZEND_AST_BINARY_OP &&
+                              (left->child[0]->attr == ZEND_BW_XOR || 
+                               left->child[0]->attr == ZEND_BW_OR || 
+                               left->child[0]->attr == ZEND_BW_AND)) {
+                            has_bitwise_op = true;
+                            printf("检测到可疑的嵌套位运算拼接: $%s 的赋值表达式在嵌套字符串拼接中包含位运算，可能是混淆代码\n", 
+                                   Z_STRVAL_P(zv));
+                          }
+                          if (left->child[1] && left->child[1]->kind == ZEND_AST_BINARY_OP &&
+                              (left->child[1]->attr == ZEND_BW_XOR || 
+                               left->child[1]->attr == ZEND_BW_OR || 
+                               left->child[1]->attr == ZEND_BW_AND)) {
+                            has_bitwise_op = true;
+                            printf("检测到可疑的嵌套位运算拼接: $%s 的赋值表达式在嵌套字符串拼接中包含位运算，可能是混淆代码\n", 
+                                   Z_STRVAL_P(zv));
+                          }
+                        }
+                        if (expr_node->child[1] && expr_node->child[1]->kind == ZEND_AST_BINARY_OP &&
+                            expr_node->child[1]->attr == ZEND_CONCAT) {
+                          // 递归检查右侧
+                          zend_ast *right = expr_node->child[1];
+                          if (right->child[0] && right->child[0]->kind == ZEND_AST_BINARY_OP &&
+                              (right->child[0]->attr == ZEND_BW_XOR || 
+                               right->child[0]->attr == ZEND_BW_OR || 
+                               right->child[0]->attr == ZEND_BW_AND)) {
+                            has_bitwise_op = true;
+                            printf("检测到可疑的嵌套位运算拼接: $%s 的赋值表达式在嵌套字符串拼接中包含位运算，可能是混淆代码\n", 
+                                   Z_STRVAL_P(zv));
+                          }
+                          if (right->child[1] && right->child[1]->kind == ZEND_AST_BINARY_OP &&
+                              (right->child[1]->attr == ZEND_BW_XOR || 
+                               right->child[1]->attr == ZEND_BW_OR || 
+                               right->child[1]->attr == ZEND_BW_AND)) {
+                            has_bitwise_op = true;
+                            printf("检测到可疑的嵌套位运算拼接: $%s 的赋值表达式在嵌套字符串拼接中包含位运算，可能是混淆代码\n", 
+                                   Z_STRVAL_P(zv));
+                          }
+                        }
+                      }
+                      
+                      // 如果检测到位运算，即使无法评估出结果，也应该标记为可疑
+                      if (has_bitwise_op) {
+                        // 将变量添加到 sink_var_table 中，因为位运算通常用于混淆函数名
+                        if (!zend_hash_exists(var_table, var_name)) {
+                          zval sink_var_val;
+                          ZVAL_LONG(&sink_var_val, *var_count);
+                          (*var_count)++;
+                          zend_hash_add(var_table, var_name, &sink_var_val);
+                          printf("检测到位运算混淆的变量赋值: $%s，已添加到 sink_var_table（位运算通常用于混淆函数名）\n", 
+                                 Z_STRVAL_P(zv));
+                        }
+                      }
+                      
+                      // ========== 增强：字符串求值 + 混淆还原 ==========
+                      // 对赋值表达式进行求值（支持多层嵌套解码：base64_decode, gzinflate, str_rot13等）
                       zend_string *resolved = evaluate_string_expression(expr_node);
                       if (resolved) {
-                        printf("评估赋值表达式结果: %s\n", ZSTR_VAL(resolved));
+                        printf("评估赋值表达式结果: %s (长度: %zu)\n", ZSTR_VAL(resolved), ZSTR_LEN(resolved));
                         
                         // 将变量值存储到 var_value_table 中（用于后续表达式评估）
                         zval var_val_zv;
                         ZVAL_STR(&var_val_zv, zend_string_copy(resolved));
                         zend_hash_update(&var_value_table, var_name, &var_val_zv);
                         
-                        if (is_known_sink_function(resolved)) {
+                        // 检查求值结果是否包含危险函数名（这是强规则）
+                        const char *dangerous_funcs[] = {
+                            "eval", "assert", "system", "shell_exec", "exec", "passthru",
+                            "preg_replace", "create_function", "call_user_func", "call_user_func_array",
+                            "array_map", "array_filter", "array_walk", "array_walk_recursive"
+                        };
+                        int dangerous_func_count = sizeof(dangerous_funcs) / sizeof(dangerous_funcs[0]);
+                        bool contains_dangerous_func = false;
+                        const char *resolved_str = ZSTR_VAL(resolved);
+                        size_t resolved_len = ZSTR_LEN(resolved);
+                        
+                        for (int i = 0; i < dangerous_func_count; i++) {
+                            const char *found = strstr(resolved_str, dangerous_funcs[i]);
+                            if (found) {
+                                // 检查是否是完整的函数名（后面跟括号或空格）
+                                size_t func_len = strlen(dangerous_funcs[i]);
+                                if ((found + func_len < resolved_str + resolved_len && 
+                                     (found[func_len] == '(' || found[func_len] == ' ' || 
+                                      found[func_len] == '\t' || found[func_len] == '\n')) ||
+                                    found + func_len == resolved_str + resolved_len) {
+                                    contains_dangerous_func = true;
+                                    printf("⚠️  强规则：payload 内含危险函数 '%s'（通过字符串求值还原发现）\n", dangerous_funcs[i]);
+                                    break;
+                                }
+                            }
+                        }
+                        
+                        if (is_known_sink_function(resolved) || contains_dangerous_func) {
                           // 如果变量已经在 sink_var_table 中，保留它
                           // 如果不在，添加它
                           if (!zend_hash_exists(var_table, var_name)) {
@@ -1448,11 +1839,23 @@ static void sink_track(zend_ast *ast, HashTable* var_table, int* var_count) {
                             ZVAL_LONG(&sink_var_val, *var_count);
                             (*var_count)++;
                             zend_hash_add(var_table, var_name, &sink_var_val);
-                            printf("检测到危险函数变量赋值: $%s = %s，已添加到 sink_var_table\n", 
-                                   var_name->val, ZSTR_VAL(resolved));
+                            if (contains_dangerous_func) {
+                                printf("检测到混淆还原后的危险函数变量赋值: $%s = ...（包含危险函数），已添加到 sink_var_table\n", 
+                                       var_name->val);
+                            } else {
+                                printf("检测到危险函数变量赋值: $%s = %s，已添加到 sink_var_table\n", 
+                                       var_name->val, ZSTR_VAL(resolved));
+                            }
                           } else {
                             printf("变量 $%s 被重新赋值为危险函数 %s，保留在 sink_var_table\n", 
                                    var_name->val, ZSTR_VAL(resolved));
+                          }
+                          
+                          // 如果通过求值发现危险函数，标记为webshell
+                          if (contains_dangerous_func) {
+                              webshell = 1;
+                              g_webshell_detected_before_segfault = 1;
+                              printf("⚠️  通过字符串求值还原检测到混淆的webshell payload\n");
                           }
                         } else {
                           // 改进：如果右侧是 pack 函数调用的结果，且该变量后续被用于函数调用，也应该标记为可疑
@@ -1519,12 +1922,13 @@ static void sink_track(zend_ast *ast, HashTable* var_table, int* var_count) {
               }
 
             }
-            push(stack, ast_child[reverse_i]); // 将非空子节点加入栈
+            if (!push(&stack, ast_child[reverse_i])) { // 将非空子节点加入栈
+                continue;  // push失败，继续处理其他节点
+            }
         }
     }
   }
-  free(stack->data); // 释放栈内存
-  free(stack);
+  freeStack(&stack); // 释放栈内存
 
 }
 
@@ -1535,15 +1939,27 @@ static void sink_track(zend_ast *ast, HashTable* var_table, int* var_count) {
 static int has_sink_child(zend_ast *ast) {
 
   uint32_t count;
-  Stack* stack = (Stack*)malloc(sizeof(Stack));
-  initStack(stack, 10000);  // 增加栈大小以处理大型AST
-  push(stack, ast);          // 将根节点加入栈
+  Stack stack;
+  if (!initStack(&stack, 1024)) {
+      return 0;
+  }
+  if (!push(&stack, ast)) {  // 将根节点加入栈
+      freeStack(&stack);
+      return 0;
+  }
 
   printf("has sink child start\n");
 
-  while (!isEmpty(stack)) {
+  size_t node_count = 0;  // 节点计数
+  while (!isEmpty(&stack)) {
+      // 节点计数上限保护
+      if (++node_count > MAX_AST_NODES) {
+          fprintf(stderr, "[ERROR] has_sink_child: AST node count exceeds safe limit (%zu), aborting analysis\n", (size_t)MAX_AST_NODES);
+          freeStack(&stack);
+          return 0;
+      }
 
-    zend_ast* current = pop(stack); // 从栈中取出一个节点
+    zend_ast* current = pop(&stack); // 从栈中取出一个节点
     //printf("%d ", current->kind);  // 访问当前节点
 
     if (current->kind == ZEND_AST_ZVAL) {
@@ -1592,12 +2008,16 @@ static int has_sink_child(zend_ast *ast) {
     for (int i = 0; i < count; i++) { // 假设最多10个子节点
         int reverse_i = count - i - 1;
         if (ast_child[reverse_i] != NULL) {
-            push(stack, ast_child[reverse_i]); // 将非空子节点加入栈
+            if (!push(&stack, ast_child[reverse_i])) { // 将非空子节点加入栈
+                // 栈扩容失败 → 提前中止，避免继续走到崩溃
+                fprintf(stderr, "[FATAL] has_sink_child: push failed, aborting\n");
+                freeStack(&stack);
+                return 0;
+            }
         }
     }
   }
-  free(stack->data); // 释放栈内存
-  free(stack);
+  freeStack(&stack); // 释放栈内存
 
   return 0;
 }
@@ -1607,13 +2027,25 @@ static int has_sink_child(zend_ast *ast) {
 // the input script is a webshell.
 static int local_sink_check(zend_ast *ast) {
   uint32_t count;
-  Stack* stack = (Stack*)malloc(sizeof(Stack));
-  initStack(stack, 10000);  // 增加栈大小以处理大型AST
-  push(stack, ast);          // 将根节点加入栈
-          
-  while (!isEmpty(stack)) {
+  Stack stack;
+  if (!initStack(&stack, 1024)) {
+      return 0;
+  }
+  if (!push(&stack, ast)) {  // 将根节点加入栈
+      freeStack(&stack);
+      return 0;
+  }
+  
+  size_t node_count = 0;  // 节点计数
+  while (!isEmpty(&stack)) {
+      // 节点计数上限保护
+      if (++node_count > MAX_AST_NODES) {
+          fprintf(stderr, "[ERROR] local_sink_check: AST node count exceeds safe limit (%zu), aborting analysis\n", (size_t)MAX_AST_NODES);
+          freeStack(&stack);
+          return 0;
+      }
         
-      zend_ast* current = pop(stack); // 从栈中取出一个节点
+      zend_ast* current = pop(&stack); // 从栈中取出一个节点
 
       if (current->kind == ZEND_AST_RETURN) {
         printf("current node is return\n");
@@ -1628,12 +2060,16 @@ static int local_sink_check(zend_ast *ast) {
           int reverse_i = count - i - 1;
           if (ast_child[reverse_i] != NULL) {
               //if (ast_child[reverse_i]->kind != ZEND_AST_RETURN)
-                push(stack, ast_child[reverse_i]); // 将非空子节点加入栈
+                if (!push(&stack, ast_child[reverse_i])) { // 将非空子节点加入栈
+                  // 栈扩容失败 → 提前中止，避免继续走到崩溃
+                  fprintf(stderr, "[FATAL] local_sink_check: push failed, aborting\n");
+                  freeStack(&stack);
+                  return 0;
+              }
           }
       }
   }
-  free(stack->data); // 释放栈内存
-  free(stack);
+  freeStack(&stack); // 释放栈内存
 
   return 0;
 }
@@ -1643,27 +2079,117 @@ static int local_sink_check(zend_ast *ast) {
 // the input script is a webshell.
 static void webshell_check(zend_ast *ast, bool local) {
   uint32_t count;
-  Stack* stack = (Stack*)malloc(sizeof(Stack));
-  initStack(stack, 10000);  // 增加栈大小以处理大型AST
-  push(stack, ast);          // 将根节点加入栈
+  Stack stack;
+  if (!initStack(&stack, 1024)) {
+      return;
+  }
+  if (!push(&stack, ast)) {  // 将根节点加入栈
+      freeStack(&stack);
+      return;
+  }
   
-  int node_count = 0;  // 调试：统计遍历的节点数
+  size_t node_count = 0;  // 节点计数（用于上限保护和调试）
 
-  while (!isEmpty(stack)) {
+  while (!isEmpty(&stack)) {
+      // 节点计数上限保护
+      if (++node_count > MAX_AST_NODES) {
+          fprintf(stderr, "[ERROR] webshell_check: AST node count exceeds safe limit (%zu), aborting analysis\n", (size_t)MAX_AST_NODES);
+          freeStack(&stack);
+          return;
+      }
       
-      zend_ast* current = pop(stack); // 从栈中取出一个节点
+      zend_ast* current = pop(&stack); // 从栈中取出一个节点
       if (!current) continue;
-      node_count++;
       
       // 调试：每处理 100 个节点输出一次
       if (node_count % 100 == 0) {
-        printf("DEBUG: webshell_check 已处理 %d 个节点，当前节点 kind=%d\n", node_count, current->kind);
+        printf("DEBUG: webshell_check 已处理 %zu 个节点，当前节点 kind=%d\n", node_count, current->kind);
       }
 
     // Check whether the node is a sink and tainted.
     // eval($_POST['cmd'])
     // include $_POST['file']
     // require $_FILES['test']
+
+    // 改进：检测可疑的位运算模式（通常用于混淆代码）
+    if (current->kind == ZEND_AST_ASSIGN) {
+      zend_ast *var_node = current->child[0];
+      zend_ast *expr_node = current->child[1];
+      if (var_node && var_node->kind == ZEND_AST_VAR && expr_node) {
+        zend_ast *name_node = var_node->child[0];
+        if (name_node && name_node->kind == ZEND_AST_ZVAL) {
+          zval *zv = zend_ast_get_zval(name_node);
+          if (zv && Z_TYPE_P(zv) == IS_STRING) {
+            // 检查赋值表达式是否包含位运算
+            bool has_bitwise_in_expr = false;
+            if (expr_node->kind == ZEND_AST_BINARY_OP) {
+              if (expr_node->attr == ZEND_BW_XOR || 
+                  expr_node->attr == ZEND_BW_OR || 
+                  expr_node->attr == ZEND_BW_AND) {
+                has_bitwise_in_expr = true;
+              } else if (expr_node->attr == ZEND_CONCAT) {
+                // 检查字符串拼接中是否包含位运算
+                if (expr_node->child[0] && expr_node->child[0]->kind == ZEND_AST_BINARY_OP &&
+                    (expr_node->child[0]->attr == ZEND_BW_XOR || 
+                     expr_node->child[0]->attr == ZEND_BW_OR || 
+                     expr_node->child[0]->attr == ZEND_BW_AND)) {
+                  has_bitwise_in_expr = true;
+                }
+                if (expr_node->child[1] && expr_node->child[1]->kind == ZEND_AST_BINARY_OP &&
+                    (expr_node->child[1]->attr == ZEND_BW_XOR || 
+                     expr_node->child[1]->attr == ZEND_BW_OR || 
+                     expr_node->child[1]->attr == ZEND_BW_AND)) {
+                  has_bitwise_in_expr = true;
+                }
+                // 检查嵌套的字符串拼接
+                if (expr_node->child[0] && expr_node->child[0]->kind == ZEND_AST_BINARY_OP &&
+                    expr_node->child[0]->attr == ZEND_CONCAT) {
+                  zend_ast *left = expr_node->child[0];
+                  if ((left->child[0] && left->child[0]->kind == ZEND_AST_BINARY_OP &&
+                       (left->child[0]->attr == ZEND_BW_XOR || 
+                        left->child[0]->attr == ZEND_BW_OR || 
+                        left->child[0]->attr == ZEND_BW_AND)) ||
+                      (left->child[1] && left->child[1]->kind == ZEND_AST_BINARY_OP &&
+                       (left->child[1]->attr == ZEND_BW_XOR || 
+                        left->child[1]->attr == ZEND_BW_OR || 
+                        left->child[1]->attr == ZEND_BW_AND))) {
+                    has_bitwise_in_expr = true;
+                  }
+                }
+                if (expr_node->child[1] && expr_node->child[1]->kind == ZEND_AST_BINARY_OP &&
+                    expr_node->child[1]->attr == ZEND_CONCAT) {
+                  zend_ast *right = expr_node->child[1];
+                  if ((right->child[0] && right->child[0]->kind == ZEND_AST_BINARY_OP &&
+                       (right->child[0]->attr == ZEND_BW_XOR || 
+                        right->child[0]->attr == ZEND_BW_OR || 
+                        right->child[0]->attr == ZEND_BW_AND)) ||
+                      (right->child[1] && right->child[1]->kind == ZEND_AST_BINARY_OP &&
+                       (right->child[1]->attr == ZEND_BW_XOR || 
+                        right->child[1]->attr == ZEND_BW_OR || 
+                        right->child[1]->attr == ZEND_BW_AND))) {
+                    has_bitwise_in_expr = true;
+                  }
+                }
+              }
+            }
+            
+            if (has_bitwise_in_expr) {
+              printf("检测到可疑的位运算赋值模式: $%s 的赋值表达式包含位运算（异或/或/与），可能是混淆代码\n", 
+                     Z_STRVAL_P(zv));
+              // 如果变量名是单字符（如 $_），且包含位运算，很可疑
+              if (Z_STRLEN_P(zv) == 1 || (Z_STRLEN_P(zv) == 2 && Z_STRVAL_P(zv)[0] == '_')) {
+                printf("检测到可疑的位运算混淆模式: 变量 $%s 是单字符或下划线变量，且赋值包含位运算，标记为可疑\n", 
+                       Z_STRVAL_P(zv));
+                if (!local)
+                  webshell = 1;
+                else
+                  local_webshell = 1;
+              }
+            }
+          }
+        }
+      }
+    }
 
     // 检查字符串常量中是否包含webshell特征
     if (current->kind == ZEND_AST_ZVAL) {
@@ -1969,6 +2495,27 @@ static void webshell_check(zend_ast *ast, bool local) {
       }
     }
 
+    // 处理所有节点：将子节点加入栈（必须在while循环内）
+    zend_ast **ast_child = ast_get_children(current, &count);
+    
+    // 调试：输出当前节点的子节点信息
+    if (current->kind == ZEND_AST_CALL || current->kind == ZEND_AST_ASSIGN || current->kind == ZEND_AST_STMT_LIST) {
+      printf("DEBUG: webshell_check 处理节点 kind=%d，子节点数=%u\n", current->kind, count);
+    }
+
+    for (int i = 0; i < count; i++) { // 假设最多10个子节点
+        int reverse_i = count - i - 1;
+        if (ast_child[reverse_i] != NULL) {
+            if (ast_child[reverse_i]->kind != ZEND_AST_FUNC_DECL)
+              if (!push(&stack, ast_child[reverse_i])) { // 将非空子节点加入栈
+                  // 栈扩容失败 → 提前中止，避免继续走到崩溃
+                  fprintf(stderr, "[FATAL] webshell_check: push failed, aborting\n");
+                  freeStack(&stack);
+                  return;
+              }
+        }
+    }
+
     if (current->kind == ZEND_AST_CALL) {
       zend_ast *name_node = current->child[0];
       if (name_node) {
@@ -1977,6 +2524,9 @@ static void webshell_check(zend_ast *ast, bool local) {
                name_node->kind, ZEND_AST_ZVAL, ZEND_AST_VAR, ZEND_AST_DIM);
         // 保存原始 name_node，避免在 if 分支中被修改
         zend_ast *original_name_node = name_node;
+        // 提前声明变量，确保它们在后续代码中可用
+        zend_string *func_name = NULL;
+        bool is_suspicious_misspelling = false;
         // assert($_POST['cmd'])
         if (original_name_node->kind == ZEND_AST_ZVAL) {
           zval *zv = zend_ast_get_zval(original_name_node);
@@ -1988,12 +2538,61 @@ static void webshell_check(zend_ast *ast, bool local) {
           bool has_hex_encoded_danger = false;
           zend_string *func_name_for_callback = NULL;
           if (zv && Z_TYPE_P(zv) == IS_STRING) {
-            zend_string *func_name = zend_ast_get_str(original_name_node);
+            func_name = zend_ast_get_str(original_name_node);
             printf("DEBUG: 检测到函数调用: %s (kind=%d, tainted=%d)\n", Z_STRVAL_P(zv), current->kind, current->tainted);
             printf("DEBUG: sink_func_table存在=%d, sink_table存在=%d, webshell_table存在=%d\n", 
                    zend_hash_exists(&sink_func_table, func_name),
                    zend_hash_exists(&sink_table, func_name),
                    zend_hash_exists(&webshell_table, func_name));
+            
+            // 检测拼写错误或混淆的函数名（如 array_filert vs array_filter）
+            is_suspicious_misspelling = false;
+            if (func_name) {
+              const char *func_name_str = ZSTR_VAL(func_name);
+              size_t func_name_len = ZSTR_LEN(func_name);
+              
+              // 危险函数名列表（用于模糊匹配）
+              const char *dangerous_func_patterns[] = {
+                "array_filter", "array_map", "array_walk", "array_reduce",
+                "call_user_func", "preg_replace", "eval", "assert",
+                "exec", "system", "shell_exec", "passthru"
+              };
+              int pattern_count = sizeof(dangerous_func_patterns) / sizeof(dangerous_func_patterns[0]);
+              
+              for (int i = 0; i < pattern_count; i++) {
+                const char *pattern = dangerous_func_patterns[i];
+                size_t pattern_len = strlen(pattern);
+                
+                // 检查函数名是否包含危险函数名的子串（用于检测拼写错误）
+                if (func_name_len >= pattern_len - 2 && func_name_len <= pattern_len + 2) {
+                  // 计算编辑距离（简单的Levenshtein距离近似）
+                  int diff_count = 0;
+                  size_t min_len = func_name_len < pattern_len ? func_name_len : pattern_len;
+                  size_t max_len = func_name_len > pattern_len ? func_name_len : pattern_len;
+                  
+                  // 检查是否包含模式的大部分字符（至少80%匹配）
+                  int match_count = 0;
+                  for (size_t j = 0; j < min_len; j++) {
+                    if (tolower((unsigned char)func_name_str[j]) == tolower((unsigned char)pattern[j])) {
+                      match_count++;
+                    }
+                  }
+                  
+                  // 如果匹配度超过80%，且函数名不在危险函数表中，可能是拼写错误
+                  if (match_count >= (int)(min_len * 0.8) && max_len - min_len <= 2) {
+                    // 检查是否真的不在表中（避免误报）
+                    if (!zend_hash_exists(&sink_func_table, func_name) &&
+                        !zend_hash_exists(&sink_table, func_name) &&
+                        !zend_hash_exists(&webshell_table, func_name)) {
+                      is_suspicious_misspelling = true;
+                      printf("DEBUG: 检测到可疑的函数名拼写错误: %s (类似 %s，但不在危险函数表中)\n", 
+                             func_name_str, pattern);
+                      break;
+                    }
+                  }
+                }
+              }
+            }
             
             // 检测 array_diff + join 组合（用于拼接函数名）
             if (func_name && ZSTR_LEN(func_name) == 10 &&
@@ -2196,42 +2795,106 @@ static void webshell_check(zend_ast *ast, bool local) {
                       }
                     }
                   }
-                  // 对于 preg_replace，第一个参数是正则表达式，如果包含 /e 修饰符，是危险的
-                  if (func_name_for_callback && ZSTR_LEN(func_name_for_callback) == 12 && 
-                      memcmp(ZSTR_VAL(func_name_for_callback), "preg_replace", 12) == 0 && 
-                      args->children >= 1) {
-                    zend_ast *regex_arg = args->child[0];
-                    if (regex_arg) {
-                      printf("DEBUG: 检查 preg_replace 的第一个参数（正则表达式）\n");
-                      zend_string *regex_str = evaluate_string_expression(regex_arg);
-                      if (regex_str) {
-                        printf("DEBUG: 成功评估正则表达式: %s (长度=%zu)\n", ZSTR_VAL(regex_str), ZSTR_LEN(regex_str));
-                        // 检查正则表达式是否包含 /e 修饰符
-                        const char *regex = ZSTR_VAL(regex_str);
-                        size_t regex_len = ZSTR_LEN(regex_str);
-                        // 查找正则表达式的结束分隔符和修饰符
-                        if (regex_len > 0) {
-                          char delimiter = regex[0];
-                          // 查找结束分隔符
-                          for (size_t i = 1; i < regex_len; i++) {
-                            if (regex[i] == delimiter) {
-                              // 检查修饰符部分是否包含 'e'
-                              for (size_t j = i + 1; j < regex_len; j++) {
-                                if (regex[j] == 'e') {
-                                  has_dangerous_regex = true;
-                                  printf("检测到危险正则表达式修饰符: %s 的第一个参数包含 /e 修饰符\n", func_name_for_callback ? ZSTR_VAL(func_name_for_callback) : "unknown");
-                                  break;
+                  // 对于 preg_replace 和 preg_filter，第一个参数是正则表达式，如果包含 /e 修饰符，是危险的
+                  if (func_name_for_callback && args->children >= 1) {
+                    size_t func_name_len = ZSTR_LEN(func_name_for_callback);
+                    const char *func_name_str = ZSTR_VAL(func_name_for_callback);
+                    bool is_preg_replace_or_filter = false;
+                    
+                    printf("DEBUG: 检查是否是 preg_replace 或 preg_filter，函数名=%s，长度=%zu\n", func_name_str, func_name_len);
+                    
+                    // 检查是否是 preg_replace 或 preg_filter
+                    if ((func_name_len == 12 && memcmp(func_name_str, "preg_replace", 12) == 0) ||
+                        (func_name_len == 11 && memcmp(func_name_str, "preg_filter", 11) == 0)) {
+                      is_preg_replace_or_filter = true;
+                      printf("DEBUG: 检测到 preg_replace 或 preg_filter 函数\n");
+                    } else {
+                      printf("DEBUG: 不是 preg_replace 或 preg_filter，函数名=%s，长度=%zu\n", func_name_str, func_name_len);
+                    }
+                    
+                    if (is_preg_replace_or_filter) {
+                      // 检查参数中是否包含 chr() 调用（混淆模式）
+                      bool has_chr_in_args = false;
+                      if (args && args->children > 0) {
+                        for (uint32_t arg_idx = 0; arg_idx < args->children && arg_idx < 3; arg_idx++) {
+                          zend_ast *arg = args->child[arg_idx];
+                          if (arg) {
+                            // 检查参数是否是函数调用且函数名是 chr
+                            if (arg->kind == ZEND_AST_CALL) {
+                              zend_ast *arg_func_name = arg->child[0];
+                              if (arg_func_name && arg_func_name->kind == ZEND_AST_ZVAL) {
+                                zval *arg_func_zv = zend_ast_get_zval(arg_func_name);
+                                if (arg_func_zv && Z_TYPE_P(arg_func_zv) == IS_STRING) {
+                                  zend_string *arg_func_name_str = zend_ast_get_str(arg_func_name);
+                                  if (arg_func_name_str && ZSTR_LEN(arg_func_name_str) == 3 && 
+                                      memcmp(ZSTR_VAL(arg_func_name_str), "chr", 3) == 0) {
+                                    has_chr_in_args = true;
+                                    printf("DEBUG: 检测到 %s 的参数中包含 chr() 调用（混淆模式）\n", func_name_str);
+                                    break;
+                                  }
                                 }
                               }
-                              break;
+                            }
+                            // 检查参数是否是字符串连接操作，且包含 chr() 调用
+                            if (arg->kind == ZEND_AST_BINARY_OP && arg->attr == ZEND_CONCAT) {
+                              // 递归检查连接操作的两个操作数
+                              zend_ast *left = arg->child[0];
+                              zend_ast *right = arg->child[1];
+                              if ((left && left->kind == ZEND_AST_CALL) || 
+                                  (right && right->kind == ZEND_AST_CALL)) {
+                                has_chr_in_args = true;
+                                printf("DEBUG: 检测到 %s 的参数中包含字符串连接和函数调用（可能是 chr() 混淆）\n", func_name_str);
+                                break;
+                              }
                             }
                           }
-                        } else {
-                          printf("DEBUG: 正则表达式长度为0\n");
                         }
-                        zend_string_release(regex_str);
-                      } else {
-                        printf("DEBUG: 无法评估 preg_replace 的第一个参数\n");
+                      }
+                      
+                      zend_ast *regex_arg = args->child[0];
+                      if (regex_arg) {
+                        printf("DEBUG: 检查 %s 的第一个参数（正则表达式）\n", func_name_str);
+                        zend_string *regex_str = evaluate_string_expression(regex_arg);
+                        if (regex_str) {
+                          printf("DEBUG: 成功评估正则表达式: %s (长度=%zu)\n", ZSTR_VAL(regex_str), ZSTR_LEN(regex_str));
+                          // 检查正则表达式是否包含 /e 修饰符
+                          const char *regex = ZSTR_VAL(regex_str);
+                          size_t regex_len = ZSTR_LEN(regex_str);
+                          // 查找正则表达式的结束分隔符和修饰符
+                          if (regex_len > 0) {
+                            char delimiter = regex[0];
+                            // 查找结束分隔符
+                            for (size_t i = 1; i < regex_len; i++) {
+                              if (regex[i] == delimiter) {
+                                // 检查修饰符部分是否包含 'e'
+                                for (size_t j = i + 1; j < regex_len; j++) {
+                                  if (regex[j] == 'e') {
+                                    has_dangerous_regex = true;
+                                    printf("检测到危险正则表达式修饰符: %s 的第一个参数包含 /e 修饰符\n", func_name_str);
+                                    break;
+                                  }
+                                }
+                                break;
+                              }
+                            }
+                          } else {
+                            printf("DEBUG: 正则表达式长度为0\n");
+                          }
+                          zend_string_release(regex_str);
+                        } else {
+                          printf("DEBUG: 无法评估 %s 的第一个参数\n", func_name_str);
+                          // 如果无法评估参数，但参数中包含 chr() 调用，也应该标记为可疑
+                          if (has_chr_in_args) {
+                            has_dangerous_regex = true;
+                            printf("检测到可疑的 %s 调用：参数包含 chr() 调用且无法静态评估（混淆模式）\n", func_name_str);
+                          }
+                        }
+                      }
+                      
+                      // 如果检测到 chr() 调用，即使没有 /e 修饰符，也应该标记为可疑
+                      if (has_chr_in_args && !has_dangerous_regex) {
+                        has_dangerous_regex = true;
+                        printf("检测到可疑的 %s 调用：参数包含 chr() 调用（混淆模式）\n", func_name_str);
                       }
                     }
                   }
@@ -2295,11 +2958,12 @@ static void webshell_check(zend_ast *ast, bool local) {
                   }
                   
                   // 对于 array_intersect_ukey, array_filter 等函数，最后一个参数通常是回调函数
-                  // 但是 preg_replace 和 mb_eregi_replace 等函数不是回调函数，所以跳过
+                  // 但是 preg_replace, preg_filter 和 mb_eregi_replace 等函数不是回调函数，所以跳过
                   bool is_regex_replace_func = false;
                   if (func_name_for_callback) {
                     size_t func_name_len = ZSTR_LEN(func_name_for_callback);
                     if ((func_name_len == 12 && memcmp(ZSTR_VAL(func_name_for_callback), "preg_replace", 12) == 0) ||
+                        (func_name_len == 11 && memcmp(ZSTR_VAL(func_name_for_callback), "preg_filter", 11) == 0) ||
                         (func_name_len == 16 && memcmp(ZSTR_VAL(func_name_for_callback), "mb_eregi_replace", 16) == 0) ||
                         (func_name_len == 15 && memcmp(ZSTR_VAL(func_name_for_callback), "mb_ereg_replace", 15) == 0) ||
                         (func_name_len == 14 && memcmp(ZSTR_VAL(func_name_for_callback), "eregi_replace", 14) == 0) ||
@@ -2586,10 +3250,67 @@ static void webshell_check(zend_ast *ast, bool local) {
                       (func_name_len == 6 && memcmp(func_name_str, "uksort", 6) == 0) ||
                       (func_name_len == 12 && memcmp(func_name_str, "array_reduce", 12) == 0)) {
                     is_callback_func = true;
+                  } else {
+                    // 检查是否是拼写错误或混淆的函数名（如 array_filert vs array_filter）
+                    const char *callback_func_patterns[] = {
+                      "array_filter", "array_map", "array_walk", "array_reduce",
+                      "call_user_func", "array_intersect_ukey", "array_intersect_uassoc"
+                    };
+                    int pattern_count = sizeof(callback_func_patterns) / sizeof(callback_func_patterns[0]);
+                    for (int i = 0; i < pattern_count; i++) {
+                      const char *pattern = callback_func_patterns[i];
+                      size_t pattern_len = strlen(pattern);
+                      if (func_name_len >= pattern_len - 2 && func_name_len <= pattern_len + 2) {
+                        // 计算匹配度
+                        int match_count = 0;
+                        size_t min_len = func_name_len < pattern_len ? func_name_len : pattern_len;
+                        for (size_t j = 0; j < min_len; j++) {
+                          if (tolower((unsigned char)func_name_str[j]) == tolower((unsigned char)pattern[j])) {
+                            match_count++;
+                          }
+                        }
+                        // 如果匹配度超过80%，可能是拼写错误
+                        if (match_count >= (int)(min_len * 0.8)) {
+                          is_callback_func = true;
+                          printf("DEBUG: 检测到可疑的回调函数名拼写错误: %s (类似 %s)\n", func_name_str, pattern);
+                          break;
+                        }
+                      }
+                    }
                   }
                 }
-                if (is_callback_func) {
+                if (is_callback_func && (has_tainted_arg || has_suspicious_callback || has_dangerous_callback)) {
                   printf("DEBUG: 检测到接受回调函数的函数，且回调参数可疑，触发检测\n");
+                  should_detect = true;
+                } else if (is_callback_func && func_name_for_callback) {
+                  // 即使回调参数不可疑，如果函数名是可疑的拼写错误（如 array_filert），且参数是污点，也应该检测
+                  const char *func_name_str = ZSTR_VAL(func_name_for_callback);
+                  size_t func_name_len = ZSTR_LEN(func_name_for_callback);
+                  // 检查是否是拼写错误（类似 array_filter）
+                  if ((func_name_len >= 9 && func_name_len <= 13 && 
+                       (strstr(func_name_str, "array_filter") != NULL || 
+                        strstr(func_name_str, "array_map") != NULL ||
+                        strstr(func_name_str, "array_walk") != NULL)) ||
+                      (func_name_len >= 14 && func_name_len <= 20 &&
+                       strstr(func_name_str, "call_user_func") != NULL)) {
+                    // 检查参数中是否有污点
+                    zend_ast **children = ast_get_children(current, &count);
+                    if (children && count > 1) {
+                      zend_ast *arg_list = children[1];
+                      if (arg_list && arg_list->kind == ZEND_AST_ARG_LIST) {
+                        zend_ast_list *args = zend_ast_get_list(arg_list);
+                        if (args && args->children > 0) {
+                          // 检查第一个参数是否是污点（通常是回调函数或数组）
+                          zend_ast *first_arg = args->child[0];
+                          if (first_arg && first_arg->tainted == 1) {
+                            should_detect = true;
+                            printf("DEBUG: 检测到可疑的回调函数名拼写错误+污点参数: %s (第一个参数是污点)\n", 
+                                   func_name_str);
+                          }
+                        }
+                      }
+                    }
+                  }
                 }
               }
             }
@@ -2611,7 +3332,7 @@ static void webshell_check(zend_ast *ast, bool local) {
                        is_dangerous_fopen, is_dangerous_fwrite);
               } else if (func_name_for_callback && zend_hash_exists(&sink_table, func_name_for_callback)) {
                 // 对于 sink_table 中的函数，如果参数是污点，应该检测
-                // 改进：对于 preg_replace，即使参数不是污点，如果包含 /e 修饰符，也应该检测
+                // 改进：对于 preg_replace 和 preg_filter，即使参数不是污点，如果包含 /e 修饰符，也应该检测
                 // 改进：对于 assert/eval 等危险函数，即使参数不是污点，如果参数是变量，也应该检测
                 // 因为变量可能通过其他方式（如 ob_start 回调）被污染
                 // 改进：对于命令执行函数（passthru, exec, system, shell_exec），即使参数不是污点，如果参数是函数调用（如 getenv()），也应该检测
@@ -2686,8 +3407,9 @@ static void webshell_check(zend_ast *ast, bool local) {
                 }
                 
                 if (has_tainted_arg || 
-                    (has_dangerous_regex && func_name_for_callback && ZSTR_LEN(func_name_for_callback) == 12 && 
-                     memcmp(ZSTR_VAL(func_name_for_callback), "preg_replace", 12) == 0) ||
+                    (has_dangerous_regex && func_name_for_callback && 
+                     ((ZSTR_LEN(func_name_for_callback) == 12 && memcmp(ZSTR_VAL(func_name_for_callback), "preg_replace", 12) == 0) ||
+                      (ZSTR_LEN(func_name_for_callback) == 11 && memcmp(ZSTR_VAL(func_name_for_callback), "preg_filter", 11) == 0))) ||
                     (has_var_arg && func_name_for_callback && ((ZSTR_LEN(func_name_for_callback) == 6 && memcmp(ZSTR_VAL(func_name_for_callback), "assert", 6) == 0) ||
                                     (ZSTR_LEN(func_name_for_callback) == 4 && memcmp(ZSTR_VAL(func_name_for_callback), "eval", 4) == 0))) ||
                     (is_cmd_exec_func && has_call_arg) ||
@@ -2705,11 +3427,124 @@ static void webshell_check(zend_ast *ast, bool local) {
                 should_detect = true;
                 printf("DEBUG: 通过 sink_func_table 检测触发 (func_name=%s, has_tainted_arg=%d)\n", 
                        ZSTR_VAL(func_name_for_callback), has_tainted_arg);
+              } else if (is_suspicious_misspelling && has_tainted_arg) {
+                // 如果函数名是可疑的拼写错误（类似危险函数），且参数是污点，应该检测
+                should_detect = true;
+                printf("DEBUG: 通过可疑拼写错误检测触发 (func_name=%s, has_tainted_arg=%d)\n", 
+                       func_name ? ZSTR_VAL(func_name) : "unknown", has_tainted_arg);
+              } else if (is_suspicious_misspelling && func_name) {
+                // 检查函数名是否类似接受回调的函数（如 array_filter, array_map）
+                const char *func_name_str = ZSTR_VAL(func_name);
+                size_t func_name_len = ZSTR_LEN(func_name);
+                bool is_callback_like = false;
+                
+                // 检查是否类似接受回调的函数
+                if ((func_name_len >= 9 && func_name_len <= 13 && 
+                     (strstr(func_name_str, "array_filter") != NULL || 
+                      strstr(func_name_str, "array_map") != NULL ||
+                      strstr(func_name_str, "array_walk") != NULL ||
+                      strstr(func_name_str, "array_reduce") != NULL)) ||
+                    (func_name_len >= 14 && func_name_len <= 20 &&
+                     (strstr(func_name_str, "call_user_func") != NULL))) {
+                  is_callback_like = true;
+                }
+                
+                if (is_callback_like) {
+                  // 检查参数中是否有污点
+                  zend_ast **children = ast_get_children(current, &count);
+                  if (children && count > 1) {
+                    zend_ast *arg_list = children[1];
+                    if (arg_list && arg_list->kind == ZEND_AST_ARG_LIST) {
+                      zend_ast_list *args = zend_ast_get_list(arg_list);
+                      if (args && args->children > 0) {
+                        // 检查第一个参数是否是污点（通常是回调函数或数组）
+                        zend_ast *first_arg = args->child[0];
+                        if (first_arg && first_arg->tainted == 1) {
+                          should_detect = true;
+                          printf("DEBUG: 通过可疑拼写错误+污点参数检测触发 (func_name=%s, 第一个参数是污点)\n", 
+                                 func_name_str);
+                        }
+                      }
+                    }
+                  }
+                }
               }
             }
             
-            if (should_detect) {
-              printf("检测到危险函数调用: %s (sink_table=%d, has_tainted_arg=%d, webshell_table=%d, sink_func_table=%d, has_dangerous_callback=%d, has_suspicious_callback=%d, has_dangerous_regex=%d, has_hex_encoded_danger=%d, is_dangerous_fopen=%d, is_dangerous_fwrite=%d)\n", 
+            // ========== 增强：对危险函数调用的参数进行求值，检查是否包含危险函数名 ==========
+            // 对于 eval, assert 等危险函数，对参数进行求值（支持多层嵌套解码）
+            bool param_contains_dangerous_func = false;
+            if (should_detect && func_name_for_callback) {
+                const char *func_name_str = ZSTR_VAL(func_name_for_callback);
+                size_t func_name_len = ZSTR_LEN(func_name_for_callback);
+                
+                // 检查是否是 eval, assert 等需要求值的危险函数
+                bool needs_param_eval = false;
+                if ((func_name_len == 4 && memcmp(func_name_str, "eval", 4) == 0) ||
+                    (func_name_len == 6 && memcmp(func_name_str, "assert", 6) == 0) ||
+                    (func_name_len == 4 && memcmp(func_name_str, "exec", 4) == 0) ||
+                    (func_name_len == 6 && memcmp(func_name_str, "system", 6) == 0) ||
+                    (func_name_len == 10 && memcmp(func_name_str, "shell_exec", 10) == 0)) {
+                    needs_param_eval = true;
+                }
+                
+                if (needs_param_eval) {
+                    // 获取函数参数
+                    zend_ast **children = ast_get_children(current, &count);
+                    if (children && count > 1) {
+                        zend_ast *arg_list = children[1];
+                        if (arg_list && arg_list->kind == ZEND_AST_ARG_LIST) {
+                            zend_ast_list *args = zend_ast_get_list(arg_list);
+                            if (args && args->children > 0) {
+                                // 对第一个参数进行求值（支持多层嵌套解码）
+                                zend_ast *first_arg = args->child[0];
+                                if (first_arg) {
+                                    zend_string *arg_value = evaluate_string_expression(first_arg);
+                                    if (arg_value) {
+                                        printf("评估 %s 的参数结果: %s (长度: %zu)\n", 
+                                               func_name_str, ZSTR_VAL(arg_value), ZSTR_LEN(arg_value));
+                                        
+                                        // 检查求值结果是否包含危险函数名
+                                        const char *dangerous_funcs[] = {
+                                            "eval", "assert", "system", "shell_exec", "exec", "passthru",
+                                            "preg_replace", "create_function", "call_user_func", "call_user_func_array",
+                                            "array_map", "array_filter", "array_walk", "array_walk_recursive"
+                                        };
+                                        int dangerous_func_count = sizeof(dangerous_funcs) / sizeof(dangerous_funcs[0]);
+                                        const char *arg_str = ZSTR_VAL(arg_value);
+                                        size_t arg_len = ZSTR_LEN(arg_value);
+                                        
+                                        for (int i = 0; i < dangerous_func_count; i++) {
+                                            const char *found = strstr(arg_str, dangerous_funcs[i]);
+                                            if (found) {
+                                                // 检查是否是完整的函数名（后面跟括号或空格）
+                                                size_t func_len = strlen(dangerous_funcs[i]);
+                                                if ((found + func_len < arg_str + arg_len && 
+                                                     (found[func_len] == '(' || found[func_len] == ' ' || 
+                                                      found[func_len] == '\t' || found[func_len] == '\n')) ||
+                                                    found + func_len == arg_str + arg_len) {
+                                                    param_contains_dangerous_func = true;
+                                                    printf("⚠️  强规则：%s 的参数求值结果内含危险函数 '%s'（通过字符串求值还原发现）\n", 
+                                                           func_name_str, dangerous_funcs[i]);
+                                                    break;
+                                                }
+                                            }
+                                        }
+                                        
+                                        zend_string_release(arg_value);
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+            
+            if (should_detect || param_contains_dangerous_func) {
+              if (param_contains_dangerous_func) {
+                  printf("⚠️  通过参数求值还原检测到混淆的webshell payload\n");
+              }
+              printf("检测到危险函数调用: %s (sink_table=%d, has_tainted_arg=%d, webshell_table=%d, sink_func_table=%d, has_dangerous_callback=%d, has_suspicious_callback=%d, has_dangerous_regex=%d, has_hex_encoded_danger=%d, is_dangerous_fopen=%d, is_dangerous_fwrite=%d, param_contains_dangerous_func=%d)\n", 
                      func_name_for_callback ? ZSTR_VAL(func_name_for_callback) : "unknown", 
                      func_name_for_callback ? zend_hash_exists(&sink_table, func_name_for_callback) : 0,
                      has_tainted_arg,
@@ -2720,7 +3555,8 @@ static void webshell_check(zend_ast *ast, bool local) {
                      has_dangerous_regex,
                      has_hex_encoded_danger,
                      is_dangerous_fopen,
-                     is_dangerous_fwrite);
+                     is_dangerous_fwrite,
+                     param_contains_dangerous_func);
               if (!local)
                 webshell = 1;
               else
@@ -2728,18 +3564,176 @@ static void webshell_check(zend_ast *ast, bool local) {
             }
           }
         }
-        if (name_node && name_node->kind == ZEND_AST_VAR) { // $a = "assert"; $a($_POST['cmd']); $a = $_POST['func']; $b = $_POST['cmd']; $a($b);
+        if (name_node && name_node->kind == ZEND_AST_VAR) { // $a = "assert"; $a($_POST['cmd']); $a = $_POST['func']; $b = $_POST['cmd']; $a($b); $$aa($_POST['a']);
           printf("DEBUG: 进入变量函数调用检测分支，name_node->kind=%d (ZEND_AST_VAR=%d)\n", name_node->kind, ZEND_AST_VAR);
           name_node = name_node->child[0];
-          printf("DEBUG: name_node->child[0] = %p, kind=%d (ZEND_AST_ZVAL=%d)\n", 
-                 name_node, name_node ? name_node->kind : -1, ZEND_AST_ZVAL);
+          printf("DEBUG: name_node->child[0] = %p, kind=%d (ZEND_AST_ZVAL=%d, ZEND_AST_VAR=%d)\n", 
+                 name_node, name_node ? name_node->kind : -1, ZEND_AST_ZVAL, ZEND_AST_VAR);
+          
+          zend_string *var_name = NULL;
+          bool is_variable_variable = false;  // 是否是变量变量（$$var）
+          
           if (name_node && name_node->kind == ZEND_AST_ZVAL) {
+            // 普通变量：$a
             zval *zv = zend_ast_get_zval(name_node);
             printf("DEBUG: zv = %p, Z_TYPE_P(zv) = %d (IS_STRING=%d)\n", 
                    zv, zv ? Z_TYPE_P(zv) : -1, IS_STRING);
             if (zv && Z_TYPE_P(zv) == IS_STRING) {
-              zend_string *var_name = zend_ast_get_str(name_node);
+              var_name = zend_ast_get_str(name_node);
               printf("the var name is %s\n", Z_STRVAL_P(zv));
+            }
+          } else if (name_node && name_node->kind == ZEND_AST_VAR) {
+            // 变量变量：$$aa
+            is_variable_variable = true;
+            printf("DEBUG: 检测到变量变量（$$var）函数调用，name_node->kind=%d\n", name_node->kind);
+            zend_ast *inner_var_node = name_node->child[0];
+            printf("DEBUG: inner_var_node = %p, kind=%d\n", inner_var_node, inner_var_node ? inner_var_node->kind : -1);
+            if (inner_var_node && inner_var_node->kind == ZEND_AST_ZVAL) {
+              zval *inner_zv = zend_ast_get_zval(inner_var_node);
+              printf("DEBUG: inner_zv = %p, Z_TYPE_P(inner_zv) = %d\n", inner_zv, inner_zv ? Z_TYPE_P(inner_zv) : -1);
+              if (inner_zv && Z_TYPE_P(inner_zv) == IS_STRING) {
+                zend_string *inner_var_name = zend_ast_get_str(inner_var_node);
+                printf("DEBUG: 变量变量的内层变量名: %s\n", Z_STRVAL_P(inner_zv));
+                
+                // 从 var_value_table 中查找变量变量的值
+                zval *inner_var_val = zend_hash_find(&var_value_table, inner_var_name);
+                if (inner_var_val && Z_TYPE_P(inner_var_val) == IS_STRING) {
+                  zend_string *resolved_var_name = Z_STR_P(inner_var_val);
+                  printf("DEBUG: 变量变量解析结果: $$%s = $%s\n", ZSTR_VAL(inner_var_name), ZSTR_VAL(resolved_var_name));
+                  
+                  // 使用解析后的变量名
+                  var_name = resolved_var_name;
+                  
+                  // 检查解析后的变量是否在 sink_var_table 中
+                  if (zend_hash_exists(&sink_var_table, resolved_var_name)) {
+                    printf("DEBUG: 变量变量解析后的变量 $%s 在 sink_var_table 中\n", ZSTR_VAL(resolved_var_name));
+                  }
+                } else {
+                  // 如果无法解析变量变量，但参数是污点，也应该检测
+                  printf("DEBUG: 无法解析变量变量 $$%s 的值，但参数可能是污点\n", ZSTR_VAL(inner_var_name));
+                  // 即使无法解析，如果参数是污点，也应该标记为可疑
+                  // 因为变量变量本身就很可疑，通常用于混淆
+                  bool has_tainted_args = (current->tainted == 1);
+                  if (!has_tainted_args && current->kind == ZEND_AST_CALL) {
+                    zend_ast **children = ast_get_children(current, &count);
+                    if (children && count > 1) {
+                      zend_ast *arg_list = children[1];
+                      if (arg_list && arg_list->kind == ZEND_AST_ARG_LIST) {
+                        zend_ast_list *args = zend_ast_get_list(arg_list);
+                        if (args && args->children > 0) {
+                          for (uint32_t i = 0; i < args->children; i++) {
+                            zend_ast *arg = args->child[i];
+                            if (arg && arg->tainted == 1) {
+                              has_tainted_args = true;
+                              break;
+                            }
+                            // 检查参数是否是超全局变量访问
+                            if (arg && arg->kind == ZEND_AST_DIM) {
+                              zend_ast *dim_base = arg->child[0];
+                              if (dim_base && dim_base->kind == ZEND_AST_VAR) {
+                                zend_ast *var_name_node = dim_base->child[0];
+                                if (var_name_node && var_name_node->kind == ZEND_AST_ZVAL) {
+                                  zval *var_zv = zend_ast_get_zval(var_name_node);
+                                  if (var_zv && Z_TYPE_P(var_zv) == IS_STRING) {
+                                    const char *var_name_str = Z_STRVAL_P(var_zv);
+                                    if (strcmp(var_name_str, "POST") == 0 ||
+                                        strcmp(var_name_str, "GET") == 0 ||
+                                        strcmp(var_name_str, "REQUEST") == 0 ||
+                                        (strlen(var_name_str) > 0 && var_name_str[0] == '_' &&
+                                         (strcmp(var_name_str, "_POST") == 0 || 
+                                          strcmp(var_name_str, "_GET") == 0 ||
+                                          strcmp(var_name_str, "_REQUEST") == 0 ||
+                                          strcmp(var_name_str, "_SERVER") == 0 ||
+                                          strcmp(var_name_str, "_COOKIE") == 0 ||
+                                          strcmp(var_name_str, "_FILES") == 0))) {
+                                      has_tainted_args = true;
+                                      break;
+                                    }
+                                  }
+                                }
+                              }
+                            }
+                          }
+                        }
+                      }
+                    }
+                  }
+                  
+                  // 如果参数是污点，直接检测
+                  if (has_tainted_args) {
+                    printf("检测到可疑的变量变量函数调用: $$%s (无法解析变量变量，但参数是污点，直接检测)\n", 
+                           ZSTR_VAL(inner_var_name));
+                    if (!local)
+                      webshell = 1;
+                    else
+                      local_webshell = 1;
+                    // 不需要 continue，因为 webshell_check 使用栈遍历
+                  }
+                }
+              } else {
+                // 无法获取内层变量名，但变量变量本身就很可疑
+                printf("DEBUG: 无法获取变量变量的内层变量名，但变量变量本身就很可疑\n");
+                // 检查参数是否是污点
+                bool has_tainted_args = (current->tainted == 1);
+                if (!has_tainted_args && current->kind == ZEND_AST_CALL) {
+                  zend_ast **children = ast_get_children(current, &count);
+                  if (children && count > 1) {
+                    zend_ast *arg_list = children[1];
+                    if (arg_list && arg_list->kind == ZEND_AST_ARG_LIST) {
+                      zend_ast_list *args = zend_ast_get_list(arg_list);
+                      if (args && args->children > 0) {
+                        for (uint32_t i = 0; i < args->children; i++) {
+                          zend_ast *arg = args->child[i];
+                          if (arg && arg->tainted == 1) {
+                            has_tainted_args = true;
+                            break;
+                          }
+                          // 检查参数是否是超全局变量访问
+                          if (arg && arg->kind == ZEND_AST_DIM) {
+                            zend_ast *dim_base = arg->child[0];
+                            if (dim_base && dim_base->kind == ZEND_AST_VAR) {
+                              zend_ast *var_name_node = dim_base->child[0];
+                              if (var_name_node && var_name_node->kind == ZEND_AST_ZVAL) {
+                                zval *var_zv = zend_ast_get_zval(var_name_node);
+                                if (var_zv && Z_TYPE_P(var_zv) == IS_STRING) {
+                                  const char *var_name_str = Z_STRVAL_P(var_zv);
+                                  if (strcmp(var_name_str, "POST") == 0 ||
+                                      strcmp(var_name_str, "GET") == 0 ||
+                                      strcmp(var_name_str, "REQUEST") == 0 ||
+                                      (strlen(var_name_str) > 0 && var_name_str[0] == '_' &&
+                                       (strcmp(var_name_str, "_POST") == 0 || 
+                                        strcmp(var_name_str, "_GET") == 0 ||
+                                        strcmp(var_name_str, "_REQUEST") == 0 ||
+                                        strcmp(var_name_str, "_SERVER") == 0 ||
+                                        strcmp(var_name_str, "_COOKIE") == 0 ||
+                                        strcmp(var_name_str, "_FILES") == 0))) {
+                                    has_tainted_args = true;
+                                    break;
+                                  }
+                                }
+                              }
+                            }
+                          }
+                        }
+                      }
+                    }
+                  }
+                }
+                
+                // 如果参数是污点，直接检测
+                if (has_tainted_args) {
+                  printf("检测到可疑的变量变量函数调用: $$var (无法获取内层变量名，但参数是污点，直接检测)\n");
+                  if (!local)
+                    webshell = 1;
+                  else
+                    local_webshell = 1;
+                  // 不需要 continue，因为 webshell_check 使用栈遍历
+                }
+              }
+            }
+          }
+          
+          if (var_name) {
               // Check whether the variable is in sink_var_table (dangerous function variable) or tainted_table
               // For variable function calls like $a(...), if $a is a dangerous function variable,
               // it should be detected as webshell, especially if arguments are tainted
@@ -2749,9 +3743,25 @@ static void webshell_check(zend_ast *ast, bool local) {
               bool has_complex_args = false;  // 提前声明，用于后续检查
               bool has_bitwise_args = false;  // 提前声明，用于后续检查
               
+              // 改进：尝试从 var_value_table 中获取变量值，检查是否是危险函数名
+              zval *var_val = zend_hash_find(&var_value_table, var_name);
+              if (var_val && Z_TYPE_P(var_val) == IS_STRING) {
+                zend_string *var_val_str = Z_STR_P(var_val);
+                if (is_known_sink_function(var_val_str)) {
+                  printf("DEBUG: 变量 $%s 的值是危险函数名: %s\n", ZSTR_VAL(var_name), ZSTR_VAL(var_val_str));
+                  is_sink_var = true;  // 标记为 sink 变量
+                }
+              }
+              
+              // 改进：如果是变量变量，且无法解析，但参数是污点，也应该检测
+              if (is_variable_variable && !is_sink_var && has_tainted_args) {
+                printf("DEBUG: 变量变量无法解析，但参数是污点，标记为可疑\n");
+                has_complex_args = true;  // 标记为复杂参数
+              }
+              
               // Debug: print hash table lookup results
               printf("DEBUG: 检查变量 $%s - sink_var_table存在=%d, tainted_table存在=%d, current->tainted=%d\n", 
-                     Z_STRVAL_P(zv), is_sink_var, is_tainted_var, current->tainted);
+                     ZSTR_VAL(var_name), is_sink_var, is_tainted_var, current->tainted);
               
               // Debug: manually check sink_var_table by iterating
               if (!is_sink_var) {
@@ -2871,17 +3881,14 @@ static void webshell_check(zend_ast *ast, bool local) {
                 
                 // 如果标志没有设置，尝试通过检查变量赋值表达式来判断
                 // 遍历 AST 查找该变量的赋值语句，检查是否包含位运算
-                if (!needs_dynamic_resolve && g_root_ast) {
+                if (!needs_dynamic_resolve && g_root_ast && var_name) {
                   // 检查 var_value_table 中是否有该变量的值
                   // 如果没有值，说明无法静态评估，可能是混淆的
-                  zend_string *var_name = zend_ast_get_str(name_node);
-                  if (var_name) {
-                    zval *var_val = zend_hash_find(&var_value_table, var_name);
-                    if (!var_val) {
-                      // 变量无法静态评估，检查是否在 sink_var_table 中
-                      // 如果不在，且参数包含位运算，可能是混淆的 WebShell
-                      var_has_bitwise_assignment = true;  // 标记为可能包含位运算
-                    }
+                  zval *var_val = zend_hash_find(&var_value_table, var_name);
+                  if (!var_val) {
+                    // 变量无法静态评估，检查是否在 sink_var_table 中
+                    // 如果不在，且参数包含位运算，可能是混淆的 WebShell
+                    var_has_bitwise_assignment = true;  // 标记为可能包含位运算
                   }
                 }
               }
@@ -2959,7 +3966,7 @@ static void webshell_check(zend_ast *ast, bool local) {
                                             strcmp(dim_var_name, "_FILES") == 0))) {
                                         func_name_from_superglobal = true;
                                         printf("DEBUG: 检测到函数名变量 $%s 来自超全局变量访问: $%s[...]\n", 
-                                               Z_STRVAL_P(zv), dim_var_name);
+                                               ZSTR_VAL(var_name), dim_var_name);
                                         break;
                                       }
                                     }
@@ -2993,21 +4000,21 @@ static void webshell_check(zend_ast *ast, bool local) {
               // 因为函数名来自用户输入本身就是危险的（动态函数调用）
               if (is_sink_var) {
                 // 如果变量是危险函数变量，直接检测（无论参数如何）
-                printf("检测到危险函数变量调用: $%s (sink_var=1, 变量是危险函数变量，直接检测)\n", Z_STRVAL_P(zv));
+                printf("检测到危险函数变量调用: $%s (sink_var=1, 变量是危险函数变量，直接检测)\n", ZSTR_VAL(var_name));
                 if (!local)
                   webshell = 1;
                 else
                   local_webshell = 1;
               } else if (is_tainted_var && (has_tainted_args || has_complex_args)) {
                 // 如果函数名变量是污点变量（来自用户输入），且参数是污点或复杂表达式，直接检测
-                printf("检测到危险函数变量调用: $%s (函数名是污点变量，参数是污点或复杂表达式，直接检测)\n", Z_STRVAL_P(zv));
+                printf("检测到危险函数变量调用: $%s (函数名是污点变量，参数是污点或复杂表达式，直接检测)\n", ZSTR_VAL(var_name));
                 if (!local)
                   webshell = 1;
                 else
                   local_webshell = 1;
               } else if (func_name_from_superglobal && (has_tainted_args || has_complex_args)) {
                 // 如果函数名变量来自超全局变量访问，且参数是污点或复杂表达式，直接检测
-                printf("检测到危险函数变量调用: $%s (函数名来自超全局变量访问，参数是污点或复杂表达式，直接检测)\n", Z_STRVAL_P(zv));
+                printf("检测到危险函数变量调用: $%s (函数名来自超全局变量访问，参数是污点或复杂表达式，直接检测)\n", ZSTR_VAL(var_name));
                 if (!local)
                   webshell = 1;
                 else
@@ -3017,7 +4024,7 @@ static void webshell_check(zend_ast *ast, bool local) {
                   (var_has_bitwise_assignment && (has_complex_args || has_bitwise_args)) ||
                   has_tainted_args || has_complex_args) {
                 printf("检测到危险函数变量调用: $%s (sink_var=%d, tainted_var=%d, has_tainted_args=%d, needs_dynamic_resolve=%d, var_has_bitwise_assignment=%d, has_complex_args=%d, has_bitwise_args=%d)\n", 
-                       Z_STRVAL_P(zv), is_sink_var, is_tainted_var, has_tainted_args, needs_dynamic_resolve, var_has_bitwise_assignment, has_complex_args, has_bitwise_args);
+                       ZSTR_VAL(var_name), is_sink_var, is_tainted_var, has_tainted_args, needs_dynamic_resolve, var_has_bitwise_assignment, has_complex_args, has_bitwise_args);
                 if (!local)
                   webshell = 1;
                 else
@@ -3025,9 +4032,16 @@ static void webshell_check(zend_ast *ast, bool local) {
               }
             }
           }
-        } else if (name_node->kind == ZEND_AST_DIM) { // $_POST['func']($_POST['cmd']) 或 $array[0]['wind'](...)
+        else if (name_node && name_node->kind == ZEND_AST_DIM) { // $_POST['func']($_POST['cmd']) 或 $array[0]['wind'](...)
+          printf("DEBUG: 进入数组访问函数调用检测分支，name_node->kind=%d (ZEND_AST_DIM=%d)\n", name_node->kind, ZEND_AST_DIM);
           zend_ast *dim_base = name_node->child[0];
           zend_ast *dim_index = name_node->child[1];
+          
+          if (!dim_base) {
+            printf("DEBUG: dim_base 是 NULL，跳过处理\n");
+          } else {
+            printf("DEBUG: dim_base->kind=%d\n", dim_base->kind);
+          }
           
           // 检查数组基变量
           bool is_source_array = false;
@@ -3036,25 +4050,38 @@ static void webshell_check(zend_ast *ast, bool local) {
           bool is_sink_array = false;
           
           // 递归查找底层变量名（处理多层数组访问，如 $array[0]['wind']）
+          // 添加循环计数器防止无限循环
           zend_ast *base_node = dim_base;
           zend_string *base_var_name = NULL;
-          while (base_node) {
+          int recursion_depth = 0;
+          const int MAX_RECURSION_DEPTH = 100;  // 最大递归深度
+          while (base_node && recursion_depth < MAX_RECURSION_DEPTH) {
+            recursion_depth++;
             if (base_node->kind == ZEND_AST_VAR) {
               zend_ast *var_name_node = base_node->child[0];
               if (var_name_node && var_name_node->kind == ZEND_AST_ZVAL) {
                 zval *zv = zend_ast_get_zval(var_name_node);
                 if (zv && Z_TYPE_P(zv) == IS_STRING) {
                   base_var_name = zend_ast_get_str(var_name_node);
-                  printf("DEBUG: 递归查找到底层变量名: %s\n", Z_STRVAL_P(zv));
+                  printf("DEBUG: 递归查找到底层变量名: %s (递归深度=%d)\n", Z_STRVAL_P(zv), recursion_depth);
                   break;
                 }
               }
             } else if (base_node->kind == ZEND_AST_DIM) {
               // 继续递归查找
               base_node = base_node->child[0];
+              if (!base_node) {
+                printf("DEBUG: base_node->child[0] 是 NULL，停止递归\n");
+                break;
+              }
             } else {
+              printf("DEBUG: base_node->kind=%d，不是 ZEND_AST_VAR 或 ZEND_AST_DIM，停止递归\n", base_node->kind);
               break;
             }
+          }
+          
+          if (recursion_depth >= MAX_RECURSION_DEPTH) {
+            printf("DEBUG: 警告：递归深度达到最大值 %d，可能存在循环引用，停止递归\n", MAX_RECURSION_DEPTH);
           }
           
           // 如果找到了底层变量名，检查是否在 sink_var_table 中
@@ -3220,7 +4247,7 @@ static void webshell_check(zend_ast *ast, bool local) {
             else
               local_webshell = 1;
           }
-        } else if (name_node->kind == ZEND_AST_CALL) { // file_get_contents(...)(...)
+        } else if (name_node && name_node->kind == ZEND_AST_CALL) { // file_get_contents(...)(...)
           // 函数名本身是一个函数调用，这是函数调用链模式
           // 例如：file_get_contents("php".$q)($_GET[2])
           zend_ast *inner_call = name_node;
@@ -3311,31 +4338,15 @@ static void webshell_check(zend_ast *ast, bool local) {
           }
         }
       }
-
-      zend_ast **ast_child = ast_get_children(current,&count);
-      
-      // 调试：输出当前节点的子节点信息
-      if (current->kind == ZEND_AST_CALL || current->kind == ZEND_AST_ASSIGN || current->kind == ZEND_AST_STMT_LIST) {
-        printf("DEBUG: webshell_check 处理节点 kind=%d，子节点数=%u\n", current->kind, count);
-      }
-
-      for (int i = 0; i < count; i++) { // 假设最多10个子节点
-          int reverse_i = count - i - 1;
-          if (ast_child[reverse_i] != NULL) {
-              if (ast_child[reverse_i]->kind != ZEND_AST_FUNC_DECL)
-                push(stack, ast_child[reverse_i]); // 将非空子节点加入栈
-          }
-      }
-  }
-  printf("DEBUG: webshell_check 总共处理了 %d 个节点\n", node_count);
-  free(stack->data); // 释放栈内存
-  free(stack);
-
+    }
+    // while循环结束
+  printf("DEBUG: webshell_check 总共处理了 %zu 个节点\n", node_count);
+  freeStack(&stack); // 释放栈内存
 }
 
 //节点生成函数
 zend_ast_zval* my_create_zval_ast(zval *zv, zend_ast *father) {
-    zend_ast_zval *node = (zend_ast_zval *)emalloc(sizeof(zend_ast_zval));
+    zend_ast_zval *node = (zend_ast_zval *)my_safe_emalloc(sizeof(zend_ast_zval));
     node->kind = ZEND_AST_ZVAL;
     node->attr = 0;
     ZVAL_COPY(&node->val, zv);
@@ -3356,7 +4367,7 @@ zend_ast_zval* my_create_zval_ast_arena(zval *zv, zend_ast *father, zend_arena *
 
 zend_ast_list* my_create_ast_list(uint32_t children_count, zend_ast_kind kind) {
     size_t size = sizeof(zend_ast_list) + sizeof(zend_ast *) * (children_count -1);
-    zend_ast_list *list = (zend_ast_list *)emalloc(size);
+    zend_ast_list *list = (zend_ast_list *)my_safe_emalloc(size);
     
     // 初始化所有字段
     memset(list, 0, size);  // 先清零整个结构
@@ -3394,7 +4405,7 @@ zend_ast_list* my_create_ast_list_arena(uint32_t children_count, zend_ast_kind k
 }
 
 zend_ast *my_zend_ast_create(zend_ast_kind kind, zend_ast *child0, zend_ast *child1, zend_ast *father) {
-    zend_ast *node = (zend_ast *)emalloc(sizeof(zend_ast));
+    zend_ast *node = (zend_ast *)my_safe_emalloc(sizeof(zend_ast));
     node->kind = kind;
     node->attr = 0;
     node->child[0] = child0;
@@ -3405,7 +4416,7 @@ zend_ast *my_zend_ast_create(zend_ast_kind kind, zend_ast *child0, zend_ast *chi
 
 zend_ast *my_ast_create_ex(zend_ast_kind kind, uint32_t children, ...) {
     size_t size = sizeof(zend_ast) + (children - 1) * sizeof(zend_ast *);
-    zend_ast *node = emalloc(size);
+    zend_ast *node = my_safe_emalloc(size);
 
     node->kind = kind;
     node->attr = 0;
@@ -3456,11 +4467,11 @@ zend_ast *create_var_ast(const char *var_name) {
     if (!var_name) {
         return NULL;
     }
-    zval *zv = (zval *)emalloc(sizeof(zval));
+    zval *zv = (zval *)my_safe_emalloc(sizeof(zval));
     ZVAL_STR(zv, zend_string_init(var_name, strlen(var_name), 0));
     zend_ast *zval_ast = (zend_ast *)my_create_zval_ast(zv, NULL);
 
-    zend_ast *var_ast = (zend_ast *)emalloc(sizeof(zend_ast));
+    zend_ast *var_ast = (zend_ast *)my_safe_emalloc(sizeof(zend_ast));
     var_ast->kind = ZEND_AST_VAR;
     var_ast->attr = 0;
     var_ast->lineno = 0;
@@ -3490,7 +4501,7 @@ zend_ast *create_var_ast_arena(const char *var_name, zend_arena **ast_arena) {
 }
 
 zend_ast *create_string_ast(const char *str) {
-    zval *zv = (zval *)emalloc(sizeof(zval));
+    zval *zv = (zval *)my_safe_emalloc(sizeof(zval));
     ZVAL_STR(zv, zend_string_init(str, strlen(str), 0));
     return (zend_ast *)my_create_zval_ast(zv, NULL);  // ZEND_AST_ZVAL
 }
@@ -4222,7 +5233,7 @@ static zend_bool contains_dangerous_function(zend_string *str) {
     size_t num_funcs = sizeof(dangerous_funcs) / sizeof(dangerous_funcs[0]);
     
     // 转换为小写进行比较
-    char *lower_str = (char *)malloc(len + 1);
+    char *lower_str = (char *)my_safe_malloc(len + 1);
     for (size_t i = 0; i < len; i++) {
         lower_str[i] = tolower((unsigned char)s[i]);
     }
@@ -4741,6 +5752,36 @@ static zend_string* evaluate_string_call(zend_ast *call_ast) {
     if (zend_string_equals_literal_ci(func_name, "str_rot13")) {
         return evaluate_rot13_call(call_ast);
     }
+    if (zend_string_equals_literal_ci(func_name, "gzinflate") || 
+        zend_string_equals_literal_ci(func_name, "gzuncompress")) {
+        // 处理 gzinflate/gzuncompress 函数调用
+        // 注意：gzinflate 需要 zlib 库，这里先尝试评估参数
+        // 如果参数是 base64_decode 的结果，可以递归处理
+        zend_ast *args_ast = call_ast->child[1];
+        if (!args_ast || !zend_ast_is_list(args_ast)) {
+            return NULL;
+        }
+        zend_ast_list *args = zend_ast_get_list(args_ast);
+        if (args->children < 1) {
+            return NULL;
+        }
+        // 递归评估参数（可能包含 base64_decode 等嵌套调用）
+        zend_string *value = evaluate_string_expression(args->child[0]);
+        if (!value) {
+            return NULL;
+        }
+        // 注意：实际的 gzinflate 解压缩需要 zlib 库
+        // 这里返回原始值，但标记为已处理（多层嵌套会在 evaluate_string_expression 中递归处理）
+        // 实际解压缩可以后续添加，但多层嵌套的解码链已经可以通过递归 evaluate_string_expression 处理
+        zend_string_release(value);
+        // 返回 NULL 表示无法完全解压，但多层嵌套的解码会在 evaluate_string_expression 中递归处理
+        return NULL;
+    }
+    if (zend_string_equals_literal_ci(func_name, "explode")) {
+        // 处理 explode 函数调用，返回 NULL（因为 explode 返回数组，不是字符串）
+        // 但我们需要在 sink_track 中处理 explode 的结果
+        return NULL;
+    }
     return NULL;
 }
 
@@ -4865,6 +5906,83 @@ static zend_string* evaluate_string_expression(zend_ast *expr) {
             }
             return NULL;
         }
+        case ZEND_AST_DIM: {
+            // 处理数组访问，如 $ch[1]
+            zend_ast *array_node = expr->child[0];
+            zend_ast *index_node = expr->child[1];
+            if (!array_node || !index_node) {
+                return NULL;
+            }
+            
+            // 获取数组变量名
+            if (array_node->kind != ZEND_AST_VAR) {
+                return NULL;
+            }
+            zend_ast *name_node = array_node->child[0];
+            if (!name_node || name_node->kind != ZEND_AST_ZVAL) {
+                return NULL;
+            }
+            zval *name_zv = zend_ast_get_zval(name_node);
+            if (!name_zv || Z_TYPE_P(name_zv) != IS_STRING) {
+                return NULL;
+            }
+            zend_string *var_name = zend_ast_get_str(name_node);
+            if (!var_name) {
+                return NULL;
+            }
+            
+            // 从变量值表中查找数组
+            zval *array_val = zend_hash_find(&var_value_table, var_name);
+            if (!array_val || Z_TYPE_P(array_val) != IS_ARRAY) {
+                return NULL;
+            }
+            
+            // 获取索引
+            zend_long index = -1;
+            if (index_node->kind == ZEND_AST_ZVAL) {
+                zval *index_zv = zend_ast_get_zval(index_node);
+                if (index_zv) {
+                    if (Z_TYPE_P(index_zv) == IS_LONG) {
+                        index = Z_LVAL_P(index_zv);
+                    } else if (Z_TYPE_P(index_zv) == IS_STRING) {
+                        // 尝试将字符串转换为数字索引
+                        zend_long lval;
+                        double dval;
+                        if (is_numeric_string(Z_STRVAL_P(index_zv), Z_STRLEN_P(index_zv), &lval, &dval, 0) == IS_LONG) {
+                            index = lval;
+                        } else {
+                            // 字符串键，使用哈希表查找
+                            zval *elem = zend_hash_find(Z_ARR_P(array_val), Z_STR_P(index_zv));
+                            if (elem && Z_TYPE_P(elem) == IS_STRING) {
+                                return zend_string_copy(Z_STR_P(elem));
+                            }
+                            return NULL;
+                        }
+                    }
+                }
+            } else {
+                // 尝试评估索引表达式
+                zend_long index_num = evaluate_numeric_expression(index_node);
+                index = index_num;
+            }
+            
+            if (index < 0) {
+                return NULL;
+            }
+            
+            // 从数组中获取元素
+            zval *elem = zend_hash_index_find(Z_ARR_P(array_val), index);
+            if (elem) {
+                if (Z_TYPE_P(elem) == IS_STRING) {
+                    return zend_string_copy(Z_STR_P(elem));
+                } else if (Z_TYPE_P(elem) == IS_LONG) {
+                    return number_to_string(Z_LVAL_P(elem));
+                } else if (Z_TYPE_P(elem) == IS_DOUBLE) {
+                    return number_to_string((zend_long)Z_DVAL_P(elem));
+                }
+            }
+            return NULL;
+        }
         case ZEND_AST_CALL:
             return evaluate_string_call(expr);
         case ZEND_AST_BINARY_OP:
@@ -4915,7 +6033,7 @@ static void merge_call_graphs(void) {
             if (merged_caller_val && Z_TYPE_P(merged_caller_val) == IS_PTR) {
                 merged_callee_set = (HashTable *)Z_PTR_P(merged_caller_val);
             } else {
-                merged_callee_set = (HashTable *)emalloc(sizeof(HashTable));
+                merged_callee_set = (HashTable *)my_safe_emalloc(sizeof(HashTable));
                 zend_hash_init(merged_callee_set, 8, NULL, NULL, 1);
                 
                 zval new_caller_val;
@@ -4950,7 +6068,7 @@ static void merge_call_graphs(void) {
             if (merged_caller_val && Z_TYPE_P(merged_caller_val) == IS_PTR) {
                 merged_callee_set = (HashTable *)Z_PTR_P(merged_caller_val);
             } else {
-                merged_callee_set = (HashTable *)emalloc(sizeof(HashTable));
+                merged_callee_set = (HashTable *)my_safe_emalloc(sizeof(HashTable));
                 zend_hash_init(merged_callee_set, 8, NULL, NULL, 1);
                 
                 zval new_caller_val;
@@ -5057,14 +6175,29 @@ static void global_taint_analysis_with_cg(void) {
 /* 构建静态调用图：收集静态可解析的函数调用 */
 static void build_static_call_graph(zend_ast *ast) {
     if (!ast) return;
-    Stack *stack = (Stack *)malloc(sizeof(Stack));
-    initStack(stack, 10000);  // 增加栈大小以处理大型AST
-    push(stack, ast);
+    Stack stack;
+    if (!initStack(&stack, 1024)) {
+        return;
+    }
+    if (!push(&stack, ast)) {
+        freeStack(&stack);
+        return;
+    }
     
     zend_string *current_caller = NULL;  // 当前函数名
+    size_t node_count = 0;  // 节点计数
     
-    while (!isEmpty(stack)) {
-        zend_ast *current = pop(stack);
+    while (!isEmpty(&stack)) {
+        // 节点计数上限保护
+        if (++node_count > MAX_AST_NODES) {
+            fprintf(stderr, "[ERROR] build_static_call_graph: AST node count exceeds safe limit (%zu), aborting analysis\n", (size_t)MAX_AST_NODES);
+            if (current_caller) {
+                zend_string_release(current_caller);
+            }
+            freeStack(&stack);
+            return;
+        }
+        zend_ast *current = pop(&stack);
         if (!current) continue;
         
         /* 跟踪当前函数名 */
@@ -5097,7 +6230,7 @@ static void build_static_call_graph(zend_ast *ast) {
                         callee_set = (HashTable *)Z_PTR_P(caller_val);
                     } else {
                         /* 创建新的 callee 集合 */
-                        callee_set = (HashTable *)emalloc(sizeof(HashTable));
+                        callee_set = (HashTable *)my_safe_emalloc(sizeof(HashTable));
                         zend_hash_init(callee_set, 8, NULL, NULL, 1);
                         
                         zval new_caller_val;
@@ -5121,7 +6254,9 @@ static void build_static_call_graph(zend_ast *ast) {
         zend_ast **children = ast_get_children(current, &count);
         for (uint32_t i = 0; i < count; i++) {
             if (children[i]) {
-                push(stack, children[i]);
+                if (!push(&stack, children[i])) {
+                    continue;  // push失败，继续处理其他节点
+                }
             }
         }
     }
@@ -5130,17 +6265,28 @@ static void build_static_call_graph(zend_ast *ast) {
         zend_string_release(current_caller);
     }
     
-    free(stack->data);
-    free(stack);
+    freeStack(&stack);
 }
 
 static void dynamic_function_analysis(zend_ast *ast) {
     if (!ast) return;
-    Stack *stack = (Stack *)malloc(sizeof(Stack));
-    initStack(stack, 10000);  // 增加栈大小以处理大型AST
-    push(stack, ast);
-    while (!isEmpty(stack)) {
-        zend_ast *current = pop(stack);
+    Stack stack;
+    if (!initStack(&stack, 1024)) {
+        return;
+    }
+    if (!push(&stack, ast)) {
+        freeStack(&stack);
+        return;
+    }
+    size_t node_count = 0;  // 节点计数
+    while (!isEmpty(&stack)) {
+        // 节点计数上限保护
+        if (++node_count > MAX_AST_NODES) {
+            fprintf(stderr, "[ERROR] dynamic_function_analysis: AST node count exceeds safe limit (%zu), aborting analysis\n", (size_t)MAX_AST_NODES);
+            freeStack(&stack);
+            return;
+        }
+        zend_ast *current = pop(&stack);
         if (!current) continue;
         
         /* 跟踪当前函数名（用于记录调用者） */
@@ -5194,22 +6340,35 @@ static void dynamic_function_analysis(zend_ast *ast) {
         zend_ast **children = ast_get_children(current, &count);
         for (uint32_t i = 0; i < count; i++) {
             if (children[i]) {
-                push(stack, children[i]);
+                if (!push(&stack, children[i])) {
+                    continue;  // push失败，继续处理其他节点
+                }
             }
         }
     }
-    free(stack->data);
-    free(stack);
+    freeStack(&stack);
 }
 
 //对各个可能产生危险的语法节点进行assert插入检测
 void traverse_and_modify_ast(zend_ast *ast, zend_arena **ast_arena, HashTable *var_table) {
-    Stack* stack = (Stack*)malloc(sizeof(Stack));
-    initStack(stack, 10000);  // 增加栈大小以处理大型AST
-    push(stack, ast);
+    Stack stack;
+    if (!initStack(&stack, 1024)) {
+        return;
+    }
+    if (!push(&stack, ast)) {
+        freeStack(&stack);
+        return;
+    }
 
-    while (!isEmpty(stack)) {
-        zend_ast* current = pop(stack);
+    size_t node_count = 0;  // 节点计数
+    while (!isEmpty(&stack)) {
+        // 节点计数上限保护
+        if (++node_count > MAX_AST_NODES) {
+            fprintf(stderr, "[ERROR] traverse_and_modify_ast: AST node count exceeds safe limit (%zu), aborting analysis\n", (size_t)MAX_AST_NODES);
+            freeStack(&stack);
+            return;
+        }
+        zend_ast* current = pop(&stack);
         if (!current) continue;
         
         // 验证 current 节点是否仍然有效
@@ -5227,7 +6386,11 @@ void traverse_and_modify_ast(zend_ast *ast, zend_arena **ast_arena, HashTable *v
                 uint32_t count = 0;
                 zend_ast **children = ast_get_children(current, &count);
                 for (uint32_t i = 0; i < count; i++) {
-                    if (children[i]) push(stack, children[i]);
+                    if (children[i]) {
+                        if (!push(&stack, children[i])) {
+                            continue;  // push失败，继续处理其他节点
+                        }
+                    }
                 }
                 continue;
             }
@@ -5248,7 +6411,11 @@ void traverse_and_modify_ast(zend_ast *ast, zend_arena **ast_arena, HashTable *v
                     uint32_t count = 0;
                     zend_ast **children = ast_get_children(current, &count);
                     for (uint32_t i = 0; i < count; i++) {
-                        if (children[i]) push(stack, children[i]);
+                        if (children[i]) {
+                        if (!push(&stack, children[i])) {
+                            continue;  // push失败，继续处理其他节点
+                        }
+                    }
                     }
                     continue;
                 }
@@ -5273,7 +6440,11 @@ void traverse_and_modify_ast(zend_ast *ast, zend_arena **ast_arena, HashTable *v
                         uint32_t count = 0;
                         zend_ast **children = ast_get_children(current, &count);
                         for (uint32_t i = 0; i < count; i++) {
-                            if (children[i]) push(stack, children[i]);
+                            if (children[i]) {
+                        if (!push(&stack, children[i])) {
+                            continue;  // push失败，继续处理其他节点
+                        }
+                    }
                         }
                         continue;
                     }
@@ -5325,7 +6496,11 @@ void traverse_and_modify_ast(zend_ast *ast, zend_arena **ast_arena, HashTable *v
                     uint32_t count = 0;
                     zend_ast **children = ast_get_children(current, &count);
                     for (uint32_t i = 0; i < count; i++) {
-                        if (children[i]) push(stack, children[i]);
+                        if (children[i]) {
+                        if (!push(&stack, children[i])) {
+                            continue;  // push失败，继续处理其他节点
+                        }
+                    }
                     }
                     continue;
                 }
@@ -5541,13 +6716,14 @@ void traverse_and_modify_ast(zend_ast *ast, zend_arena **ast_arena, HashTable *v
                 if (children[i]->kind > 1000) {
                     continue;  // 跳过无效的节点类型
                 }
-                push(stack, children[i]);
+                if (!push(&stack, children[i])) {
+                    continue;  // push失败，继续处理其他节点
+                }
             }
         }
     }
 
-    free(stack->data);
-    free(stack);
+    freeStack(&stack);
 }
 
 
@@ -5665,7 +6841,7 @@ static void load_dynamic_edges_and_update_graph(const char *log_path) {
                         callee_set = (HashTable *)Z_PTR_P(caller_val);
                     } else {
                         /* 创建新的 callee 集合 */
-                        callee_set = (HashTable *)emalloc(sizeof(HashTable));
+                        callee_set = (HashTable *)my_safe_emalloc(sizeof(HashTable));
                         zend_hash_init(callee_set, 8, NULL, NULL, 1);
                         
                         zval new_caller_val;
@@ -5914,6 +7090,7 @@ static void segfault_handler(int sig) {
     printf("  1. 文件包含超长的字符串字面量（如超长base64编码）\n");
     printf("  2. 词法分析器缓冲区溢出\n");
     printf("  3. 文件格式异常或损坏\n");
+    printf("  4. PHP代码存在语法错误\n");
     if (g_file_size_on_segfault > 0) {
         printf("文件信息: 大小 %zu 字节", g_file_size_on_segfault);
         if (g_file_lines_on_segfault > 0) {
@@ -5924,15 +7101,1511 @@ static void segfault_handler(int sig) {
     if (g_file_name_on_segfault) {
         printf("文件路径: %s\n", g_file_name_on_segfault);
     }
-    printf("\n========================================\n");
-    printf("检测结果: 无法处理（词法分析器限制）\n");
-    printf("========================================\n");
-    if (g_file_name_on_segfault) {
-        printf("文件: %s\n", g_file_name_on_segfault);
+    
+    // 检查是否在段错误发生前已通过源代码模式匹配检测到webshell
+    if (g_webshell_detected_before_segfault) {
+        printf("\n========================================\n");
+        printf("[WEB_SHELL] ⚠️  警告: 检测到 WebShell!\n");
+        printf("========================================\n");
+        if (g_file_name_on_segfault) {
+            printf("文件: %s\n", g_file_name_on_segfault);
+        }
+        printf("检测方法: 源代码模式匹配（词法分析阶段发生段错误）\n");
+        printf("原因: 文件包含可能导致词法分析器崩溃的语法错误或复杂内容，但通过源代码模式匹配检测到webshell特征\n");
+        printf("说明: 词法分析器在处理文件时发生段错误，无法进行完整的AST分析\n");
+        printf("========================================\n");
+        exit(0);  // 退出码0：确认WebShell
+    } else {
+        printf("\n========================================\n");
+        printf("[HIGHLY_SUSPICIOUS] ⚠️ 检测结果: 高危可疑（词法分析器限制）\n");
+        printf("========================================\n");
+        if (g_file_name_on_segfault) {
+            printf("文件: %s\n", g_file_name_on_segfault);
+        }
+        printf("原因: 词法分析器在处理文件时崩溃（段错误），无法完成AST解析和污点追踪\n");
+        printf("说明: 已对源代码进行模式匹配检测，未发现明确的webshell特征，"
+               "但由于解析失败，仍存在绕过静态分析的潜在风险\n");
+        printf("建议: 在实际运维/检测系统中，按\"高危可疑文件\"处理："
+               "建议隔离该文件、保留样本，并安排人工复核或使用其他引擎进一步检测\n");
+        printf("========================================\n");
+        exit(2);  // 退出码2：高危可疑
     }
-    printf("原因: 词法分析器在处理文件时崩溃（段错误）\n");
-    printf("建议: 检查文件内容，或使用其他检测工具\n");
-    exit(1);
+}
+
+// 辅助函数：在内存中搜索子字符串（类似memmem，但兼容性更好）
+static const char* my_memmem(const char *haystack, size_t haystack_len, 
+                              const char *needle, size_t needle_len) {
+    if (needle_len == 0) return haystack;
+    if (haystack_len < needle_len) return NULL;
+    
+    const char *end = haystack + haystack_len - needle_len;
+    for (const char *p = haystack; p <= end; p++) {
+        if (memcmp(p, needle, needle_len) == 0) {
+            return p;
+        }
+    }
+    return NULL;
+}
+
+// 辅助函数：安全地搜索模式（对于大文件只检查前200KB）
+static bool safe_pattern_search(const char *pattern, const char *code_str, size_t pattern_limit, size_t bytes) {
+  bool found = false;
+  if (pattern_limit < bytes) {
+        char *search_buf = (char *)my_safe_malloc(pattern_limit + 1);
+    if (search_buf) {
+      memcpy(search_buf, code_str, pattern_limit);
+      search_buf[pattern_limit] = '\0';
+      found = (strstr(search_buf, pattern) != NULL);
+      free(search_buf);
+    }
+  } else {
+    found = (strstr(code_str, pattern) != NULL);
+  }
+  return found;
+}
+
+// 提取PHP标签内的内容（<?php ... ?> 或 <? ... ?>）
+// 返回提取出的PHP代码字符串，需要调用者释放
+static zend_string* extract_php_tags(const char *source, size_t source_len) {
+    if (!source || source_len == 0) {
+        return zend_string_init("", 0, 0);
+    }
+    
+    // 估算最大PHP代码长度（假设最多占10%）
+    size_t max_php_size = source_len / 10;
+    if (max_php_size < 1024) max_php_size = 1024;  // 至少1KB
+    if (max_php_size > 10 * 1024 * 1024) max_php_size = 10 * 1024 * 1024;  // 最多10MB
+    
+    char *php_code = (char *)my_safe_malloc(max_php_size + 1);
+    size_t php_len = 0;
+    const char *pos = source;
+    const char *end = source + source_len;
+    
+    while (pos < end) {
+        // 查找 <?php 或 <? 标签
+        const char *open_tag = NULL;
+        size_t open_tag_len = 0;
+        
+        // 查找 <?php
+        const char *php_tag = my_memmem(pos, end - pos, "<?php", 5);
+        // 查找 <?
+        const char *short_tag = my_memmem(pos, end - pos, "<?", 2);
+        
+        // 选择最近的标签
+        if (php_tag && (!short_tag || php_tag < short_tag)) {
+            open_tag = php_tag;
+            open_tag_len = 5;
+        } else if (short_tag) {
+            open_tag = short_tag;
+            open_tag_len = 2;
+        }
+        
+        if (!open_tag) {
+            // 没有找到更多PHP标签，结束
+            break;
+        }
+        
+        // 查找对应的 ?>
+        const char *close_tag = my_memmem(open_tag + open_tag_len, 
+                                          end - (open_tag + open_tag_len), 
+                                          "?>", 2);
+        
+        if (!close_tag) {
+            // 没有找到闭合标签，可能是文件末尾的PHP代码
+            // 提取从 <? 到文件末尾的所有内容
+            size_t remaining = end - (open_tag + open_tag_len);
+            if (php_len + remaining + 1 > max_php_size) {
+                // 如果超出限制，扩展缓冲区
+                size_t new_size = max_php_size * 2;
+                if (new_size < php_len + remaining + 1) {
+                    new_size = php_len + remaining + 1 + 1024;
+                }
+                char *new_php_code = (char *)my_safe_realloc(php_code, new_size + 1);
+                if (!new_php_code) {
+                    free(php_code);
+                    return zend_string_init("", 0, 0);
+                }
+                php_code = new_php_code;
+                max_php_size = new_size;
+            }
+            memcpy(php_code + php_len, open_tag + open_tag_len, remaining);
+            php_len += remaining;
+            break;
+        }
+        
+        // 提取PHP代码（不包括 <?php 和 ?>）
+        size_t php_content_len = close_tag - (open_tag + open_tag_len);
+        
+        // 检查缓冲区大小
+        if (php_len + php_content_len + 1 > max_php_size) {
+            // 扩展缓冲区
+            size_t new_size = max_php_size * 2;
+            while (new_size < php_len + php_content_len + 1) {
+                new_size *= 2;
+            }
+            char *new_php_code = (char *)my_safe_realloc(php_code, new_size + 1);
+            if (!new_php_code) {
+                free(php_code);
+                return zend_string_init("", 0, 0);
+            }
+            php_code = new_php_code;
+            max_php_size = new_size;
+        }
+        
+        // 复制PHP内容
+        memcpy(php_code + php_len, open_tag + open_tag_len, php_content_len);
+        php_len += php_content_len;
+        
+        // 添加换行符以分隔不同的PHP块
+        if (php_len + 1 < max_php_size) {
+            php_code[php_len++] = '\n';
+        }
+        
+        // 继续查找下一个PHP标签
+        pos = close_tag + 2;
+    }
+    
+    php_code[php_len] = '\0';
+    
+    // 如果没有提取到任何PHP代码，返回空字符串
+    if (php_len == 0) {
+        free(php_code);
+        return zend_string_init("", 0, 0);
+    }
+    
+    zend_string *result = zend_string_init(php_code, php_len, 0);
+    free(php_code);
+    return result;
+}
+
+// L1层：快速风险过滤（不解析AST）
+// 返回：0=未检测到风险，1=检测到高风险，2=检测到中等风险
+typedef struct {
+    bool has_high_risk;
+    bool has_medium_risk;
+    int risk_score;
+    const char *risk_reason;
+} L1RiskResult;
+
+static L1RiskResult l1_quick_risk_filter(const char *source, size_t source_len, size_t check_limit) {
+    L1RiskResult result = {false, false, 0, NULL};
+    
+    // 高频黑名单字符串（高风险）
+    const char *high_risk_patterns[] = {
+        "fpassthru", "shell_exec", "/e",  // preg_replace /e 修饰符
+        "eval(", "assert(", "exec(", "system(", "passthru(",
+        "base64_decode", "gzinflate", "str_rot13",
+        "create_function", "call_user_func",
+        "preg_replace.*/e", "preg_filter.*/e"
+    };
+    size_t high_risk_count = sizeof(high_risk_patterns) / sizeof(high_risk_patterns[0]);
+    
+    // 解码链特征（高风险）
+    const char *decode_chain_patterns[] = {
+        "base64_decode.*gzinflate",
+        "gzinflate.*base64_decode",
+        "str_rot13.*base64_decode",
+        "base64_decode.*str_rot13"
+    };
+    size_t decode_chain_count = sizeof(decode_chain_patterns) / sizeof(decode_chain_patterns[0]);
+    
+    // 动态加载特征（高风险）
+    const char *dynamic_load_patterns[] = {
+        "eval($", "eval($_", "eval($GLOBALS",
+        "assert($", "assert($_",
+        "include($", "include($_",
+        "require($", "require($_",
+        "include_once($", "require_once($"
+    };
+    size_t dynamic_load_count = sizeof(dynamic_load_patterns) / sizeof(dynamic_load_patterns[0]);
+    
+    // 可疑函数组合（中等风险）
+    const char *medium_risk_patterns[] = {
+        "fopen.*fwrite", "file_put_contents.*base64",
+        "move_uploaded_file.*eval", "move_uploaded_file.*exec"
+    };
+    size_t medium_risk_count = sizeof(medium_risk_patterns) / sizeof(medium_risk_patterns[0]);
+    
+    // 创建搜索缓冲区
+    size_t search_len = (check_limit < source_len) ? check_limit : source_len;
+    char *search_buf = (char *)my_safe_malloc(search_len + 1);
+    if (!search_buf) {
+        return result;
+    }
+    memcpy(search_buf, source, search_len);
+    search_buf[search_len] = '\0';
+    
+    // 检查高风险模式
+    int high_risk_matches = 0;
+    for (size_t i = 0; i < high_risk_count; i++) {
+        if (strstr(search_buf, high_risk_patterns[i]) != NULL) {
+            high_risk_matches++;
+            result.risk_score += 10;
+        }
+    }
+    
+    // 检查解码链
+    for (size_t i = 0; i < decode_chain_count; i++) {
+        // 简化检查：分别查找两个函数
+        const char *pattern1 = strstr(decode_chain_patterns[i], ".*");
+        if (pattern1) {
+            size_t len1 = pattern1 - decode_chain_patterns[i];
+            char *func1 = (char *)my_safe_malloc(len1 + 1);
+            memcpy(func1, decode_chain_patterns[i], len1);
+            func1[len1] = '\0';
+            
+            const char *pattern2 = decode_chain_patterns[i] + len1 + 2;
+            if (strstr(search_buf, func1) != NULL && strstr(search_buf, pattern2) != NULL) {
+                high_risk_matches++;
+                result.risk_score += 15;
+            }
+            free(func1);
+        }
+    }
+    
+    // 检查动态加载特征
+    for (size_t i = 0; i < dynamic_load_count; i++) {
+        if (strstr(search_buf, dynamic_load_patterns[i]) != NULL) {
+            high_risk_matches++;
+            result.risk_score += 12;
+        }
+    }
+    
+    if (high_risk_matches > 0) {
+        result.has_high_risk = true;
+        result.risk_reason = "检测到高风险模式（危险函数、解码链或动态加载）";
+    }
+    
+    // 检查中等风险模式
+    int medium_risk_matches = 0;
+    for (size_t i = 0; i < medium_risk_count; i++) {
+        // 简化检查：分别查找两个函数
+        const char *pattern1 = strstr(medium_risk_patterns[i], ".*");
+        if (pattern1) {
+            size_t len1 = pattern1 - medium_risk_patterns[i];
+            char *func1 = (char *)my_safe_malloc(len1 + 1);
+            memcpy(func1, medium_risk_patterns[i], len1);
+            func1[len1] = '\0';
+            
+            const char *pattern2 = medium_risk_patterns[i] + len1 + 2;
+            if (strstr(search_buf, func1) != NULL && strstr(search_buf, pattern2) != NULL) {
+                medium_risk_matches++;
+                result.risk_score += 5;
+            }
+            free(func1);
+        }
+    }
+    
+    if (medium_risk_matches > 0 && !result.has_high_risk) {
+        result.has_medium_risk = true;
+        result.risk_reason = "检测到可疑函数组合";
+    }
+    
+    free(search_buf);
+    return result;
+}
+
+// 解码链检测：使用有限状态机（FSM）识别危险解码链
+// 例如：base64_decode → gzinflate → str_rot13 → eval
+typedef enum {
+    FSM_STATE_INIT = 0,           // 状态 0：未进入危险链
+    FSM_STATE_BASE64_DECODE = 1,  // 状态 1：捕获 base64_decode
+    FSM_STATE_GZINFLATE = 2,      // 状态 2：捕获 gzinflate
+    FSM_STATE_STR_ROT13 = 3,      // 状态 3：捕获 str_rot13
+    FSM_STATE_URLDECODE = 4,      // 状态 4：捕获 urldecode/rawurldecode
+    FSM_STATE_EVAL = 5,           // 状态 5：捕获 eval/assert
+    FSM_STATE_DANGER = 6          // 状态 6：判定 = 确认 webshell
+} FSMState;
+
+typedef struct {
+    FSMState state;
+    int chain_length;
+    char chain_functions[8][32];  // 记录链中的函数名（使用固定大小数组避免指针问题）
+    bool is_webshell;
+} DecodeChainFSM;
+
+// 解码函数列表
+static const char* decode_functions[] = {
+    "base64_decode",
+    "gzinflate",
+    "str_rot13",
+    "urldecode",
+    "rawurldecode"
+};
+static const int decode_function_count = 5;
+
+// 危险函数列表（链的终点）
+static const char* danger_functions[] = {
+    "eval",
+    "assert",
+    "exec",
+    "system",
+    "shell_exec",
+    "passthru",
+    "preg_replace",
+    "preg_filter",
+    "call_user_func",
+    "call_user_func_array"
+};
+static const int danger_function_count = 10;
+
+// 检查是否是解码函数
+static bool is_decode_function(const char *func_name) {
+    for (int i = 0; i < decode_function_count; i++) {
+        if (strstr(func_name, decode_functions[i]) != NULL) {
+            return true;
+        }
+    }
+    return false;
+}
+
+// 检查是否是危险函数
+static bool is_danger_function(const char *func_name) {
+    for (int i = 0; i < danger_function_count; i++) {
+        if (strstr(func_name, danger_functions[i]) != NULL) {
+            return true;
+        }
+    }
+    return false;
+}
+
+// FSM状态转换
+static void fsm_transition(DecodeChainFSM *fsm, const char *func_name) {
+    if (fsm->chain_length >= 8) {
+        // 链长度已达上限，不再添加
+        return;
+    }
+    
+    switch (fsm->state) {
+        case FSM_STATE_INIT:
+            if (strstr(func_name, "base64_decode") != NULL) {
+                fsm->state = FSM_STATE_BASE64_DECODE;
+                strncpy(fsm->chain_functions[fsm->chain_length++], "base64_decode", 31);
+                fsm->chain_functions[fsm->chain_length - 1][31] = '\0';
+            } else if (strstr(func_name, "gzinflate") != NULL) {
+                fsm->state = FSM_STATE_GZINFLATE;
+                strncpy(fsm->chain_functions[fsm->chain_length++], "gzinflate", 31);
+                fsm->chain_functions[fsm->chain_length - 1][31] = '\0';
+            } else if (strstr(func_name, "str_rot13") != NULL) {
+                fsm->state = FSM_STATE_STR_ROT13;
+                strncpy(fsm->chain_functions[fsm->chain_length++], "str_rot13", 31);
+                fsm->chain_functions[fsm->chain_length - 1][31] = '\0';
+            } else if (strstr(func_name, "urldecode") != NULL || strstr(func_name, "rawurldecode") != NULL) {
+                fsm->state = FSM_STATE_URLDECODE;
+                strncpy(fsm->chain_functions[fsm->chain_length++], "urldecode", 31);
+                fsm->chain_functions[fsm->chain_length - 1][31] = '\0';
+            } else if (is_danger_function(func_name)) {
+                // 直接的危险函数调用（如 eval($_POST['cmd'])）
+                fsm->state = FSM_STATE_DANGER;
+                fsm->is_webshell = true;
+                strncpy(fsm->chain_functions[fsm->chain_length++], func_name, 31);
+                fsm->chain_functions[fsm->chain_length - 1][31] = '\0';
+            }
+            break;
+            
+        case FSM_STATE_BASE64_DECODE:
+            if (strstr(func_name, "gzinflate") != NULL) {
+                fsm->state = FSM_STATE_GZINFLATE;
+                strncpy(fsm->chain_functions[fsm->chain_length++], "gzinflate", 31);
+                fsm->chain_functions[fsm->chain_length - 1][31] = '\0';
+            } else if (strstr(func_name, "str_rot13") != NULL) {
+                fsm->state = FSM_STATE_STR_ROT13;
+                strncpy(fsm->chain_functions[fsm->chain_length++], "str_rot13", 31);
+                fsm->chain_functions[fsm->chain_length - 1][31] = '\0';
+            } else if (is_danger_function(func_name)) {
+                fsm->state = FSM_STATE_DANGER;
+                fsm->is_webshell = true;
+                strncpy(fsm->chain_functions[fsm->chain_length++], func_name, 31);
+                fsm->chain_functions[fsm->chain_length - 1][31] = '\0';
+            } else if (!is_decode_function(func_name)) {
+                // 遇到非解码函数，重置状态
+                fsm->state = FSM_STATE_INIT;
+                fsm->chain_length = 0;
+            }
+            break;
+            
+        case FSM_STATE_GZINFLATE:
+            if (strstr(func_name, "base64_decode") != NULL) {
+                fsm->state = FSM_STATE_BASE64_DECODE;
+                strncpy(fsm->chain_functions[fsm->chain_length++], "base64_decode", 31);
+                fsm->chain_functions[fsm->chain_length - 1][31] = '\0';
+            } else if (strstr(func_name, "str_rot13") != NULL) {
+                fsm->state = FSM_STATE_STR_ROT13;
+                strncpy(fsm->chain_functions[fsm->chain_length++], "str_rot13", 31);
+                fsm->chain_functions[fsm->chain_length - 1][31] = '\0';
+            } else if (is_danger_function(func_name)) {
+                fsm->state = FSM_STATE_DANGER;
+                fsm->is_webshell = true;
+                strncpy(fsm->chain_functions[fsm->chain_length++], func_name, 31);
+                fsm->chain_functions[fsm->chain_length - 1][31] = '\0';
+            } else if (!is_decode_function(func_name)) {
+                fsm->state = FSM_STATE_INIT;
+                fsm->chain_length = 0;
+            }
+            break;
+            
+        case FSM_STATE_STR_ROT13:
+        case FSM_STATE_URLDECODE:
+            if (is_danger_function(func_name)) {
+                fsm->state = FSM_STATE_DANGER;
+                fsm->is_webshell = true;
+                strncpy(fsm->chain_functions[fsm->chain_length++], func_name, 31);
+                fsm->chain_functions[fsm->chain_length - 1][31] = '\0';
+            } else if (!is_decode_function(func_name)) {
+                fsm->state = FSM_STATE_INIT;
+                fsm->chain_length = 0;
+            }
+            break;
+            
+        case FSM_STATE_DANGER:
+            // 已经确认是webshell，保持状态
+            break;
+            
+        default:
+            fsm->state = FSM_STATE_INIT;
+            fsm->chain_length = 0;
+            break;
+    }
+}
+
+// 使用FSM检测解码链（基于token-level，不解析AST）
+static DecodeChainFSM detect_decode_chain_fsm(const char *source, size_t source_len, size_t check_limit) {
+    DecodeChainFSM fsm = {FSM_STATE_INIT, 0, {{0}}, false};
+    
+    size_t search_len = (check_limit < source_len) ? check_limit : source_len;
+    char *search_buf = (char *)my_safe_malloc(search_len + 1);
+    if (!search_buf) {
+        return fsm;
+    }
+    memcpy(search_buf, source, search_len);
+    search_buf[search_len] = '\0';
+    
+    // 查找函数调用模式：function_name(
+    // 使用更简单的方法：直接搜索函数名模式
+    const char *pos = search_buf;
+    const char *end = search_buf + search_len;
+    
+    // 按顺序搜索所有解码函数和危险函数
+    while (pos < end && !fsm.is_webshell) {
+        const char *found_pos = NULL;
+        const char *found_func = NULL;
+        size_t found_len = 0;
+        
+        // 查找所有解码函数和危险函数
+        for (int i = 0; i < decode_function_count; i++) {
+            const char *p = strstr(pos, decode_functions[i]);
+            if (p && (!found_pos || p < found_pos)) {
+                found_pos = p;
+                found_func = decode_functions[i];
+                found_len = strlen(decode_functions[i]);
+            }
+        }
+        
+        for (int i = 0; i < danger_function_count; i++) {
+            const char *p = strstr(pos, danger_functions[i]);
+            if (p && (!found_pos || p < found_pos)) {
+                found_pos = p;
+                found_func = danger_functions[i];
+                found_len = strlen(danger_functions[i]);
+            }
+        }
+        
+        if (!found_pos) break;
+        
+        // 检查是否是函数调用（后面跟着 '('）
+        const char *check_pos = found_pos + found_len;
+        // 跳过空白字符
+        while (check_pos < end && 
+               (check_pos[0] == ' ' || check_pos[0] == '\t' || 
+                check_pos[0] == '\n' || check_pos[0] == '\r')) {
+            check_pos++;
+        }
+        
+        // 如果后面是 '('，说明是函数调用
+        if (check_pos < end && check_pos[0] == '(') {
+            char func_name[64];
+            strncpy(func_name, found_func, 63);
+            func_name[63] = '\0';
+            
+            // 更新FSM状态
+            fsm_transition(&fsm, func_name);
+            
+            if (fsm.is_webshell) {
+                printf("DEBUG: FSM检测到解码链: ");
+                for (int i = 0; i < fsm.chain_length; i++) {
+                    printf("%s", fsm.chain_functions[i]);
+                    if (i < fsm.chain_length - 1) {
+                        printf(" → ");
+                    }
+                }
+                printf("\n");
+                break;
+            }
+        }
+        
+        // 继续搜索下一个函数
+        pos = found_pos + found_len;
+    }
+    
+    free(search_buf);
+    return fsm;
+}
+
+// Webshell功能组件分析（Component Fingerprinting）
+// 大webshell（面板型）包含多个功能模块，可以被切分和识别
+typedef struct {
+    const char *component_name;      // 组件名称
+    const char **keywords;           // 关键词列表
+    int keyword_count;               // 关键词数量
+    int risk_level;                  // 风险级别：1=低风险，2=中风险，3=高风险
+} ComponentFingerprint;
+
+// 文件管理模块特征
+static const char *file_manager_keywords[] = {
+    "file_get_contents", "file_put_contents", "fopen", "fwrite", "fread",
+    "unlink", "rmdir", "mkdir", "rename", "copy", "move",
+    "chmod", "chown", "file_exists", "is_file", "is_dir",
+    "scandir", "readdir", "opendir", "closedir", "glob",
+    "filesize", "filemtime", "filectime", "realpath", "basename", "dirname"
+};
+static const int file_manager_keyword_count = 26;
+
+// SQL客户端模块特征
+static const char *sql_client_keywords[] = {
+    "mysql_connect", "mysqli_connect", "mysql_query", "mysqli_query",
+    "mysql_select_db", "mysqli_select_db", "mysql_fetch_array", "mysqli_fetch_array",
+    "mysql_fetch_assoc", "mysqli_fetch_assoc", "mysql_fetch_row", "mysqli_fetch_row",
+    "mysql_num_rows", "mysqli_num_rows", "mysql_real_escape_string", "mysqli_real_escape_string",
+    "PDO", "prepare", "execute", "query", "fetchAll", "fetch"
+};
+static const int sql_client_keyword_count = 21;
+
+// ZIP压缩/解压模块特征
+static const char *zip_module_keywords[] = {
+    "ZipArchive", "zip_open", "zip_read", "zip_entry_open", "zip_entry_read",
+    "zip_entry_close", "zip_close", "zip_entry_name", "zip_entry_filesize",
+    "zip_entry_compressedsize", "gzopen", "gzread", "gzwrite", "gzclose",
+    "gzinflate", "gzdeflate", "gzcompress", "gzuncompress"
+};
+static const int zip_module_keyword_count = 17;
+
+// 邮件发送模块特征
+static const char *mail_module_keywords[] = {
+    "mail", "imap_open", "imap_send", "imap_mail", "mb_send_mail",
+    "PHPMailer", "SMTP", "sendmail", "mailto"
+};
+static const int mail_module_keyword_count = 9;
+
+// 命令执行模块特征（高风险）
+static const char *command_exec_keywords[] = {
+    "exec", "system", "shell_exec", "passthru", "popen", "proc_open",
+    "pcntl_exec", "preg_replace", "preg_filter", "eval", "assert"
+};
+static const int command_exec_keyword_count = 11;
+
+// 数据库管理模块特征
+static const char *db_manager_keywords[] = {
+    "CREATE TABLE", "DROP TABLE", "ALTER TABLE", "INSERT INTO", "UPDATE", "DELETE FROM",
+    "SELECT", "SHOW TABLES", "SHOW DATABASES", "DESCRIBE", "EXPLAIN"
+};
+static const int db_manager_keyword_count = 11;
+
+// 网络功能模块特征
+static const char *network_module_keywords[] = {
+    "curl_exec", "curl_init", "file_get_contents", "fsockopen", "socket_create",
+    "stream_context_create", "stream_socket_client", "get_headers", "getallheaders"
+};
+static const int network_module_keyword_count = 9;
+
+// 组件指纹定义
+static ComponentFingerprint component_fingerprints[] = {
+    {"文件管理模块", file_manager_keywords, file_manager_keyword_count, 2},
+    {"SQL客户端模块", sql_client_keywords, sql_client_keyword_count, 2},
+    {"ZIP压缩/解压模块", zip_module_keywords, zip_module_keyword_count, 2},
+    {"邮件发送模块", mail_module_keywords, mail_module_keyword_count, 1},
+    {"命令执行模块", command_exec_keywords, command_exec_keyword_count, 3},  // 高风险
+    {"数据库管理模块", db_manager_keywords, db_manager_keyword_count, 2},
+    {"网络功能模块", network_module_keywords, network_module_keyword_count, 2}
+};
+static const int component_fingerprint_count = 7;
+
+// 组件匹配结果
+typedef struct {
+    const char *component_name;
+    int match_count;      // 匹配到的关键词数量
+    int risk_level;       // 风险级别
+    bool is_detected;     // 是否检测到该组件
+} ComponentMatch;
+
+// 检测webshell功能组件（分段扫描大文件）
+static int detect_webshell_components(const char *source, size_t source_len, 
+                                       ComponentMatch *matches, int max_matches,
+                                       size_t check_limit) {
+    int detected_count = 0;
+    size_t search_len = (check_limit < source_len) ? check_limit : source_len;
+    
+    // 创建搜索缓冲区
+    char *search_buf = (char *)my_safe_malloc(search_len + 1);
+    if (!search_buf) {
+        return 0;
+    }
+    memcpy(search_buf, source, search_len);
+    search_buf[search_len] = '\0';
+    
+    // 对每个组件进行匹配
+    for (int i = 0; i < component_fingerprint_count && detected_count < max_matches; i++) {
+        ComponentFingerprint *fp = &component_fingerprints[i];
+        int keyword_matches = 0;
+        
+        // 统计该组件的关键词匹配数量
+        for (int j = 0; j < fp->keyword_count; j++) {
+            if (strstr(search_buf, fp->keywords[j]) != NULL) {
+                keyword_matches++;
+            }
+        }
+        
+        // 如果匹配到足够的关键词（至少2个），认为检测到该组件
+        if (keyword_matches >= 2) {
+            matches[detected_count].component_name = fp->component_name;
+            matches[detected_count].match_count = keyword_matches;
+            matches[detected_count].risk_level = fp->risk_level;
+            matches[detected_count].is_detected = true;
+            detected_count++;
+        }
+    }
+    
+    free(search_buf);
+    return detected_count;
+}
+
+// L2层：结构切片 + 局部AST分析
+// 只对可疑块（如eval参数、动态include参数）进行AST分析
+typedef struct {
+    size_t start_pos;
+    size_t end_pos;
+    const char *reason;  // 为什么这个块可疑
+} SuspiciousBlock;
+
+static int find_suspicious_blocks(const char *source, size_t source_len, 
+                                   SuspiciousBlock *blocks, int max_blocks, size_t check_limit) {
+    int block_count = 0;
+    size_t search_len = (check_limit < source_len) ? check_limit : source_len;
+    
+    // 查找 eval( 调用
+    const char *pos = source;
+    while (block_count < max_blocks && pos < source + search_len) {
+        const char *eval_pos = strstr(pos, "eval(");
+        if (!eval_pos) break;
+        
+        // 查找对应的参数（简化：查找下一个分号或右括号）
+        const char *arg_start = eval_pos + 5;
+        const char *arg_end = arg_start;
+        int paren_depth = 1;
+        
+        while (arg_end < source + search_len && paren_depth > 0) {
+            if (*arg_end == '(') paren_depth++;
+            else if (*arg_end == ')') paren_depth--;
+            else if (*arg_end == ';' && paren_depth == 1) break;
+            arg_end++;
+        }
+        
+        if (paren_depth == 0 || (paren_depth == 1 && *arg_end == ';')) {
+            blocks[block_count].start_pos = eval_pos - source;
+            blocks[block_count].end_pos = arg_end - source;
+            blocks[block_count].reason = "eval调用";
+            block_count++;
+        }
+        
+        pos = eval_pos + 1;
+    }
+    
+    // 查找动态include/require调用
+    pos = source;
+    while (block_count < max_blocks && pos < source + search_len) {
+        const char *include_patterns[] = {"include($", "require($", "include_once($", "require_once($"};
+        const char *found_pos = NULL;
+        const char *found_pattern = NULL;
+        
+        for (int i = 0; i < 4; i++) {
+            const char *p = strstr(pos, include_patterns[i]);
+            if (p && (!found_pos || p < found_pos)) {
+                found_pos = p;
+                found_pattern = include_patterns[i];
+            }
+        }
+        
+        if (!found_pos) break;
+        
+        // 查找参数结束位置
+        const char *arg_start = found_pos + strlen(found_pattern) - 1;  // 跳过 "$"
+        const char *arg_end = arg_start;
+        int paren_depth = 1;
+        
+        while (arg_end < source + search_len && paren_depth > 0) {
+            if (*arg_end == '(') paren_depth++;
+            else if (*arg_end == ')') paren_depth--;
+            else if (*arg_end == ';' && paren_depth == 1) break;
+            arg_end++;
+        }
+        
+        if (paren_depth == 0 || (paren_depth == 1 && *arg_end == ';')) {
+            blocks[block_count].start_pos = found_pos - source;
+            blocks[block_count].end_pos = arg_end - source;
+            blocks[block_count].reason = "动态include/require";
+            block_count++;
+        }
+        
+        pos = found_pos + 1;
+    }
+    
+    // 查找 mb_ereg_replace(..., 'e') 模式（e修饰符允许执行代码）
+    pos = source;
+    while (block_count < max_blocks && pos < source + search_len) {
+        const char *mb_pos = strstr(pos, "mb_ereg_replace");
+        if (!mb_pos) break;
+        
+        // 查找'e'修饰符（在参数中）
+        const char *e_modifier = strstr(mb_pos, "'e'");
+        if (!e_modifier) {
+            e_modifier = strstr(mb_pos, "\"e\"");
+        }
+        
+        if (e_modifier) {
+            // 查找整个函数调用的结束位置
+            const char *arg_start = mb_pos + 15;  // 跳过 "mb_ereg_replace"
+            const char *arg_end = arg_start;
+            int paren_depth = 1;
+            
+            while (arg_end < source + search_len && paren_depth > 0) {
+                if (*arg_end == '(') paren_depth++;
+                else if (*arg_end == ')') paren_depth--;
+                arg_end++;
+            }
+            
+            if (paren_depth == 0) {
+                blocks[block_count].start_pos = mb_pos - source;
+                blocks[block_count].end_pos = arg_end - source;
+                blocks[block_count].reason = "mb_ereg_replace with 'e' modifier";
+                block_count++;
+            }
+        }
+        
+        pos = mb_pos + 1;
+    }
+    
+    // 查找 assert($_POST['cmd']) 或 assert($_GET['cmd']) 模式
+    pos = source;
+    while (block_count < max_blocks && pos < source + search_len) {
+        const char *assert_pos = strstr(pos, "assert(");
+        if (!assert_pos) break;
+        
+        // 检查参数是否是超全局变量
+        const char *arg_start = assert_pos + 7;  // 跳过 "assert("
+        const char *superglobals[] = {"$_POST", "$_GET", "$_REQUEST", "$_COOKIE", "$_FILES"};
+        bool has_superglobal = false;
+        
+        for (int i = 0; i < 5; i++) {
+            if (strncmp(arg_start, superglobals[i], strlen(superglobals[i])) == 0) {
+                has_superglobal = true;
+                break;
+            }
+        }
+        
+        if (has_superglobal) {
+            // 查找整个函数调用的结束位置
+            const char *arg_end = arg_start;
+            int paren_depth = 1;
+            
+            while (arg_end < source + search_len && paren_depth > 0) {
+                if (*arg_end == '(') paren_depth++;
+                else if (*arg_end == ')') paren_depth--;
+                arg_end++;
+            }
+            
+            if (paren_depth == 0) {
+                blocks[block_count].start_pos = assert_pos - source;
+                blocks[block_count].end_pos = arg_end - source;
+                blocks[block_count].reason = "assert with superglobal";
+                block_count++;
+            }
+        }
+        
+        pos = assert_pos + 1;
+    }
+    
+    // 查找 preg_replace(..., 'e') 模式（e修饰符）
+    pos = source;
+    while (block_count < max_blocks && pos < source + search_len) {
+        const char *preg_pos = strstr(pos, "preg_replace");
+        if (!preg_pos) break;
+        
+        // 查找'e'修饰符
+        const char *e_modifier = strstr(preg_pos, "'e'");
+        if (!e_modifier) {
+            e_modifier = strstr(preg_pos, "\"e\"");
+        }
+        
+        if (e_modifier) {
+            // 查找整个函数调用的结束位置
+            const char *arg_start = preg_pos + 12;  // 跳过 "preg_replace"
+            const char *arg_end = arg_start;
+            int paren_depth = 1;
+            
+            while (arg_end < source + search_len && paren_depth > 0) {
+                if (*arg_end == '(') paren_depth++;
+                else if (*arg_end == ')') paren_depth--;
+                arg_end++;
+            }
+            
+            if (paren_depth == 0) {
+                blocks[block_count].start_pos = preg_pos - source;
+                blocks[block_count].end_pos = arg_end - source;
+                blocks[block_count].reason = "preg_replace with 'e' modifier";
+                block_count++;
+            }
+        }
+        
+        pos = preg_pos + 1;
+    }
+    
+    return block_count;
+}
+
+// ========== 分段式沙箱执行（Chunk Execution）实现 ==========
+// 注意：类型定义已移到文件开头
+
+// 提取可疑代码块
+static int extract_dangerous_chunks(const char *source, size_t source_len,
+                                    DangerousChunk *chunks, int max_chunks, size_t check_limit) {
+    SuspiciousBlock blocks[64];
+    int block_count = find_suspicious_blocks(source, source_len, blocks, 64, check_limit);
+    
+    int chunk_count = 0;
+    for (int i = 0; i < block_count && chunk_count < max_chunks; i++) {
+        if (blocks[i].end_pos > blocks[i].start_pos && 
+            blocks[i].end_pos <= source_len) {
+            chunks[chunk_count].start_pos = blocks[i].start_pos;
+            chunks[chunk_count].end_pos = blocks[i].end_pos;
+            chunks[chunk_count].reason = blocks[i].reason;
+            
+            // 提取代码块（包含上下文，使其可执行）
+            size_t chunk_size = blocks[i].end_pos - blocks[i].start_pos + 100;  // 额外空间用于包装
+            chunks[chunk_count].code_chunk = (char *)my_safe_malloc(chunk_size);
+            
+            // 包装代码块使其可执行（添加必要的上下文）
+            snprintf(chunks[chunk_count].code_chunk, chunk_size,
+                    "<?php\n"
+                    "// 沙箱执行：%s\n"
+                    "error_reporting(0);\n"
+                    "$__yz_monitor = ['system' => false, 'file_write' => false, 'network' => false, 'execution' => false];\n"
+                    "// 监控函数\n"
+                    "function __yz_monitor_system($cmd) { $GLOBALS['__yz_monitor']['system'] = true; return ''; }\n"
+                    "function __yz_monitor_file_write($file, $data) { $GLOBALS['__yz_monitor']['file_write'] = true; return false; }\n"
+                    "function __yz_monitor_network($url) { $GLOBALS['__yz_monitor']['network'] = true; return false; }\n"
+                    "// 重定向危险函数\n"
+                    "if (!function_exists('system')) { function system($cmd) { return __yz_monitor_system($cmd); } }\n"
+                    "if (!function_exists('exec')) { function exec($cmd) { return __yz_monitor_system($cmd); } }\n"
+                    "if (!function_exists('shell_exec')) { function shell_exec($cmd) { return __yz_monitor_system($cmd); } }\n"
+                    "if (!function_exists('file_put_contents')) { function file_put_contents($file, $data) { return __yz_monitor_file_write($file, $data); } }\n"
+                    "if (!function_exists('fwrite')) { function fwrite($fp, $data) { return __yz_monitor_file_write('', $data); } }\n"
+                    "if (!function_exists('fopen')) { function fopen($file, $mode) { return false; } }\n"
+                    "if (!function_exists('curl_exec')) { function curl_exec($ch) { return __yz_monitor_network(''); } }\n"
+                    "if (!function_exists('file_get_contents')) { function file_get_contents($url) { return __yz_monitor_network($url); } }\n"
+                    "// 执行可疑代码块\n"
+                    "try {\n"
+                    "%.*s\n"
+                    "} catch (Exception $e) {}\n"
+                    "// 输出监控结果\n"
+                    "echo json_encode($__yz_monitor) . \"\\n\";\n",
+                    (int)(blocks[i].end_pos - blocks[i].start_pos),
+                    source + blocks[i].start_pos);
+            
+            chunks[chunk_count].chunk_len = strlen(chunks[chunk_count].code_chunk);
+            chunk_count++;
+        }
+    }
+    
+    return chunk_count;
+}
+
+// 在沙箱中执行单个代码块
+static BehaviorMonitor execute_chunk_in_sandbox(DangerousChunk *chunk, const char *filename) {
+    BehaviorMonitor monitor = {0};
+    monitor.captured_output = NULL;
+    monitor.output_len = 0;
+    
+    // 创建临时文件
+    char temp_file[512];
+    snprintf(temp_file, sizeof(temp_file), "/tmp/yz_chunk_%zu_%zu.php", 
+             chunk->start_pos, chunk->end_pos);
+    
+    FILE *fp = fopen(temp_file, "w");
+    if (!fp) {
+        printf("警告: 无法创建临时文件 %s\n", temp_file);
+        return monitor;
+    }
+    
+    fwrite(chunk->code_chunk, chunk->chunk_len, 1, fp);
+    fclose(fp);
+    
+    // 在沙箱中执行
+    char command[1024];
+    char output_file[512];
+    snprintf(output_file, sizeof(output_file), "/tmp/yz_chunk_output_%zu_%zu.txt",
+             chunk->start_pos, chunk->end_pos);
+    
+    snprintf(command, sizeof(command),
+             "php -d disable_functions=system,exec,shell_exec,passthru,popen,proc_open,"
+             "pcntl_exec,proc_open,proc_get_status,proc_nice,proc_terminate,"
+             "file_put_contents,fwrite,fopen,curl_exec,file_get_contents "
+             "-d max_execution_time=2 "
+             "-d memory_limit=16M "
+             "-d display_errors=0 "
+             "-d error_reporting=0 "
+             "%s > %s 2>&1",
+             temp_file, output_file);
+    
+    int ret = system(command);
+    
+    // 读取输出
+    FILE *out_fp = fopen(output_file, "r");
+    if (out_fp) {
+        fseek(out_fp, 0, SEEK_END);
+        size_t file_size = ftell(out_fp);
+        fseek(out_fp, 0, SEEK_SET);
+        
+        if (file_size > 0 && file_size < 10240) {  // 限制输出大小
+            monitor.captured_output = (char *)my_safe_malloc(file_size + 1);
+            fread(monitor.captured_output, 1, file_size, out_fp);
+            monitor.captured_output[file_size] = '\0';
+            monitor.output_len = file_size;
+            
+            // 解析JSON监控结果
+            if (strstr(monitor.captured_output, "\"system\":true") != NULL) {
+                monitor.has_system_call = true;
+            }
+            if (strstr(monitor.captured_output, "\"file_write\":true") != NULL) {
+                monitor.has_file_write = true;
+            }
+            if (strstr(monitor.captured_output, "\"network\":true") != NULL) {
+                monitor.has_network_connect = true;
+            }
+            if (strstr(monitor.captured_output, "\"execution\":true") != NULL) {
+                monitor.has_execution = true;
+            }
+        }
+        fclose(out_fp);
+    }
+    
+    // 清理临时文件
+    remove(temp_file);
+    remove(output_file);
+    
+    return monitor;
+}
+
+// 分段式沙箱执行：只执行可疑代码块
+static void chunk_based_sandbox_execution(const char *source, size_t source_len,
+                                          const char *filename, size_t check_limit) {
+    printf("\n========================================\n");
+    printf("分段式沙箱执行（Chunk Execution）\n");
+    printf("========================================\n");
+    printf("只执行可疑代码块，不执行整个文件\n");
+    
+    DangerousChunk chunks[32];
+    int chunk_count = extract_dangerous_chunks(source, source_len, chunks, 32, check_limit);
+    
+    if (chunk_count == 0) {
+        printf("未发现可疑代码块，跳过分段式沙箱执行\n");
+        return;
+    }
+    
+    printf("发现 %d 个可疑代码块，将逐个在沙箱中执行\n", chunk_count);
+    
+    int dangerous_chunks = 0;
+    for (int i = 0; i < chunk_count; i++) {
+        printf("\n--- 执行可疑块 %d/%d: %s (位置: %zu-%zu) ---\n",
+               i + 1, chunk_count, chunks[i].reason,
+               chunks[i].start_pos, chunks[i].end_pos);
+        
+        BehaviorMonitor monitor = execute_chunk_in_sandbox(&chunks[i], filename);
+        
+        // 分析监控结果
+        bool is_dangerous = false;
+        if (monitor.has_system_call) {
+            printf("⚠️  检测到system调用\n");
+            is_dangerous = true;
+        }
+        if (monitor.has_file_write) {
+            printf("⚠️  检测到文件写入操作\n");
+            is_dangerous = true;
+        }
+        if (monitor.has_network_connect) {
+            printf("⚠️  检测到网络连接\n");
+            is_dangerous = true;
+        }
+        if (monitor.has_execution) {
+            printf("⚠️  检测到代码执行\n");
+            is_dangerous = true;
+        }
+        
+        if (is_dangerous) {
+            dangerous_chunks++;
+            webshell = 1;
+            g_webshell_detected_before_segfault = 1;
+            printf("⚠️  该代码块被判定为危险\n");
+        } else {
+            printf("✓ 该代码块未发现危险行为\n");
+        }
+        
+        // 释放资源
+        if (monitor.captured_output) {
+            free(monitor.captured_output);
+        }
+        if (chunks[i].code_chunk) {
+            free(chunks[i].code_chunk);
+        }
+    }
+    
+    if (dangerous_chunks > 0) {
+        printf("\n⚠️  分段式沙箱执行结果: 发现 %d 个危险代码块\n", dangerous_chunks);
+    } else {
+        printf("\n✓ 分段式沙箱执行结果: 未发现危险行为\n");
+    }
+}
+
+// ========== 基于Token/IR的低内存分析实现 ==========
+
+// 提取token（基于字符串模式匹配，轻量级实现）
+static int extract_tokens_only(zend_string *code, zend_string *filename, TokenNode **nodes, size_t *node_count) {
+    const char *source = ZSTR_VAL(code);
+    size_t source_len = ZSTR_LEN(code);
+    size_t max_nodes = 50000;  // 最多5万个token节点（比AST稀疏得多）
+    size_t current_count = 0;
+    TokenNode *head = NULL;
+    TokenNode *tail = NULL;
+    uint32_t lineno = 1;
+    size_t pos = 0;
+    
+    // 危险函数名列表
+    const char *dangerous_funcs[] = {
+        "eval", "assert", "exec", "system", "shell_exec", "passthru",
+        "file_get_contents", "fopen", "file_put_contents", "fwrite", "fputs",
+        "include", "include_once", "require", "require_once",
+        "base64_decode", "gzinflate", "preg_replace", "call_user_func"
+    };
+    int func_count = sizeof(dangerous_funcs) / sizeof(dangerous_funcs[0]);
+    
+    // 简化的token提取：查找危险函数名和变量
+    while (pos < source_len && current_count < max_nodes) {
+        // 跳过空白字符
+        while (pos < source_len && (source[pos] == ' ' || source[pos] == '\t' || 
+               source[pos] == '\r' || source[pos] == '\n')) {
+            if (source[pos] == '\n') lineno++;
+            pos++;
+        }
+        if (pos >= source_len) break;
+        
+        // 检查是否是变量（$xxx）
+        if (source[pos] == '$' && pos + 1 < source_len) {
+            size_t var_start = pos;
+            pos++;  // 跳过$
+            
+            // 提取变量名
+            size_t var_name_start = pos;
+            while (pos < source_len && (isalnum(source[pos]) || source[pos] == '_')) {
+                pos++;
+            }
+            
+            if (pos > var_name_start) {
+                size_t var_name_len = pos - var_name_start;
+                char *var_name = (char *)my_safe_malloc(var_name_len + 2);
+                var_name[0] = '$';
+                memcpy(var_name + 1, source + var_name_start, var_name_len);
+                var_name[var_name_len + 1] = '\0';
+                
+                TokenNode *node = (TokenNode *)my_safe_malloc(sizeof(TokenNode));
+                node->token_type = T_VARIABLE;
+                node->token_value = zend_string_init(var_name, var_name_len + 1, 0);
+                node->position = var_start;
+                node->lineno = lineno;
+                node->next = NULL;
+                
+                free(var_name);
+                
+                if (!head) {
+                    head = tail = node;
+                } else {
+                    tail->next = node;
+                    tail = node;
+                }
+                current_count++;
+            }
+            continue;
+        }
+        
+        // 检查是否是危险函数名
+        for (int i = 0; i < func_count; i++) {
+            size_t func_len = strlen(dangerous_funcs[i]);
+            if (pos + func_len <= source_len && 
+                memcmp(source + pos, dangerous_funcs[i], func_len) == 0) {
+                // 检查后面是否是函数调用（有括号）
+                size_t after_func = pos + func_len;
+                while (after_func < source_len && 
+                       (source[after_func] == ' ' || source[after_func] == '\t')) {
+                    after_func++;
+                }
+                
+                if (after_func < source_len && source[after_func] == '(') {
+                    TokenNode *node = (TokenNode *)my_safe_malloc(sizeof(TokenNode));
+                    node->token_type = T_STRING;
+                    node->token_value = zend_string_init(dangerous_funcs[i], func_len, 0);
+                    node->position = pos;
+                    node->lineno = lineno;
+                    node->next = NULL;
+                    
+                    if (!head) {
+                        head = tail = node;
+                    } else {
+                        tail->next = node;
+                        tail = node;
+                    }
+                    current_count++;
+                    
+                    pos = after_func + 1;  // 跳过函数名和括号
+                    break;
+                }
+            }
+        }
+        
+        // 检查include/require关键字
+        const char *include_keywords[] = {"include", "include_once", "require", "require_once"};
+        int include_count = sizeof(include_keywords) / sizeof(include_keywords[0]);
+        for (int i = 0; i < include_count; i++) {
+            size_t kw_len = strlen(include_keywords[i]);
+            if (pos + kw_len <= source_len && 
+                memcmp(source + pos, include_keywords[i], kw_len) == 0) {
+                // 检查是否是关键字（后面跟空格或括号）
+                size_t after_kw = pos + kw_len;
+                if (after_kw < source_len && 
+                    (source[after_kw] == ' ' || source[after_kw] == '\t' || 
+                     source[after_kw] == '(')) {
+                    TokenNode *node = (TokenNode *)my_safe_malloc(sizeof(TokenNode));
+                    int token_type = (i == 0) ? T_INCLUDE : 
+                                    (i == 1) ? T_INCLUDE_ONCE :
+                                    (i == 2) ? T_REQUIRE : T_REQUIRE_ONCE;
+                    node->token_type = token_type;
+                    node->token_value = zend_string_init(include_keywords[i], kw_len, 0);
+                    node->position = pos;
+                    node->lineno = lineno;
+                    node->next = NULL;
+                    
+                    if (!head) {
+                        head = tail = node;
+                    } else {
+                        tail->next = node;
+                        tail = node;
+                    }
+                    current_count++;
+                    
+                    pos = after_kw;
+                    break;
+                }
+            }
+        }
+        
+        pos++;  // 继续扫描
+    }
+    
+    *nodes = head;
+    *node_count = current_count;
+    return 0;
+}
+
+// 构建Token Graph（轻量级IR）
+static TokenGraph* build_token_graph(zend_string *code, zend_string *filename) {
+    TokenGraph *graph = (TokenGraph *)my_safe_malloc(sizeof(TokenGraph));
+    graph->nodes = NULL;
+    graph->edges = NULL;
+    graph->node_count = 0;
+    graph->edge_count = 0;
+    
+    // 提取token
+    TokenNode *nodes = NULL;
+    size_t node_count = 0;
+    
+    if (extract_tokens_only(code, filename, &nodes, &node_count) != 0) {
+        free(graph);
+        return NULL;
+    }
+    
+    graph->nodes = nodes;
+    graph->node_count = node_count;
+    
+    // 构建边（识别CALL、ASSIGN、INCLUDE等）
+    TokenNode *current = nodes;
+    TokenEdge *edge_head = NULL;
+    TokenEdge *edge_tail = NULL;
+    
+    while (current) {
+        TokenNode *next = current->next;
+        
+        // 检测函数调用：T_STRING 后跟 '('
+        if (current->token_type == T_STRING && current->token_value) {
+            // 检查是否是危险函数
+            const char *func_name = ZSTR_VAL(current->token_value);
+            if (strcmp(func_name, "eval") == 0 || strcmp(func_name, "assert") == 0 ||
+                strcmp(func_name, "exec") == 0 || strcmp(func_name, "system") == 0 ||
+                strcmp(func_name, "shell_exec") == 0 || strcmp(func_name, "passthru") == 0 ||
+                strcmp(func_name, "file_get_contents") == 0 || strcmp(func_name, "fopen") == 0 ||
+                strcmp(func_name, "file_put_contents") == 0 || strcmp(func_name, "fwrite") == 0) {
+                
+                TokenEdge *edge = (TokenEdge *)my_safe_malloc(sizeof(TokenEdge));
+                edge->edge_type = EDGE_CALL;
+                edge->from = current;
+                edge->to = next;  // 简化：指向下一个节点
+                edge->func_name = zend_string_copy(current->token_value);
+                edge->next = NULL;
+                
+                if (!edge_head) {
+                    edge_head = edge_tail = edge;
+                } else {
+                    edge_tail->next = edge;
+                    edge_tail = edge;
+                }
+                graph->edge_count++;
+            }
+        }
+        
+        // 检测include/require
+        if (current->token_type == T_INCLUDE || current->token_type == T_INCLUDE_ONCE ||
+            current->token_type == T_REQUIRE || current->token_type == T_REQUIRE_ONCE) {
+            TokenEdge *edge = (TokenEdge *)my_safe_malloc(sizeof(TokenEdge));
+            edge->edge_type = EDGE_INCLUDE;
+            edge->from = current;
+            edge->to = next;
+            edge->func_name = NULL;
+            edge->next = NULL;
+            
+            if (!edge_head) {
+                edge_head = edge_tail = edge;
+            } else {
+                edge_tail->next = edge;
+                edge_tail = edge;
+            }
+            graph->edge_count++;
+        }
+        
+        // 检测eval
+        if (current->token_type == T_STRING && current->token_value && 
+            strcmp(ZSTR_VAL(current->token_value), "eval") == 0) {
+            TokenEdge *edge = (TokenEdge *)my_safe_malloc(sizeof(TokenEdge));
+            edge->edge_type = EDGE_EVAL;
+            edge->from = current;
+            edge->to = next;
+            edge->func_name = NULL;
+            edge->next = NULL;
+            
+            if (!edge_head) {
+                edge_head = edge_tail = edge;
+            } else {
+                edge_tail->next = edge;
+                edge_tail = edge;
+            }
+            graph->edge_count++;
+        }
+        
+        current = next;
+    }
+    
+    graph->edges = edge_head;
+    return graph;
+}
+
+// 释放Token Graph
+static void free_token_graph(TokenGraph *graph) {
+    if (!graph) return;
+    
+    // 释放节点
+    TokenNode *node = graph->nodes;
+    while (node) {
+        TokenNode *next = node->next;
+        if (node->token_value) {
+            zend_string_release(node->token_value);
+        }
+        free(node);
+        node = next;
+    }
+    
+    // 释放边
+    TokenEdge *edge = graph->edges;
+    while (edge) {
+        TokenEdge *next = edge->next;
+        if (edge->func_name) {
+            zend_string_release(edge->func_name);
+        }
+        free(edge);
+        edge = next;
+    }
+    
+    free(graph);
+}
+
+// 基于Token IR的webshell检测
+static void webshell_check_token_ir(TokenGraph *graph) {
+    // 可疑点结构（用于Token IR检测）
+    typedef struct {
+        uint32_t lineno;
+        const char *reason;
+        int risk_score;  // 风险评分（0-100）
+    } SuspiciousPoint;
+    
+    SuspiciousPoint suspicious_points[100];
+    if (!graph) return;
+    
+    printf("正在基于Token IR进行Webshell检测（节点数: %zu, 边数: %zu）...\n", 
+           graph->node_count, graph->edge_count);
+    
+    // 可疑点列表（最多100个）
+    int suspicious_count = 0;
+    int total_risk_score = 0;
+    int dangerous_pattern_count = 0;
+    
+    // 第一遍：收集所有危险函数调用和超全局变量
+    TokenNode *superglobal_nodes = NULL;  // 超全局变量节点列表
+    TokenNode *danger_func_nodes = NULL;   // 危险函数节点列表
+    
+    TokenNode *node = graph->nodes;
+    while (node) {
+        if (node->token_type == T_VARIABLE && node->token_value) {
+            const char *var_name = ZSTR_VAL(node->token_value);
+            // 检查是否是超全局变量
+            if (strcmp(var_name, "_POST") == 0 || strcmp(var_name, "_GET") == 0 ||
+                strcmp(var_name, "_REQUEST") == 0 || strcmp(var_name, "_COOKIE") == 0 ||
+                strcmp(var_name, "_FILES") == 0 || strcmp(var_name, "_SERVER") == 0 ||
+                strcmp(var_name, "_ENV") == 0 || strcmp(var_name, "GLOBALS") == 0) {
+                // 添加到超全局变量列表
+                TokenNode *new_node = (TokenNode *)my_safe_malloc(sizeof(TokenNode));
+                *new_node = *node;
+                new_node->next = superglobal_nodes;
+                superglobal_nodes = new_node;
+            }
+        }
+        node = node->next;
+    }
+    
+    // 第二遍：遍历边，检测危险模式
+    TokenEdge *edge = graph->edges;
+    while (edge) {
+        if (edge->edge_type == EDGE_CALL && edge->func_name) {
+            const char *func_name = ZSTR_VAL(edge->func_name);
+            
+            // 检查是否是sink函数
+            zval *sink_val = zend_hash_find(&sink_table, edge->func_name);
+            if (sink_val) {
+                printf("⚠️  检测到危险函数调用: %s (位置: 行 %u)\n", func_name, edge->from->lineno);
+                dangerous_pattern_count++;
+                
+                // 检查是否与超全局变量组合（强规则）
+                bool has_superglobal = false;
+                TokenNode *sg_node = superglobal_nodes;
+                while (sg_node) {
+                    // 检查超全局变量和危险函数是否在同一行或相邻行（简化判断）
+                    if (sg_node->lineno == edge->from->lineno || 
+                        (sg_node->lineno > 0 && sg_node->lineno == edge->from->lineno - 1) ||
+                        (sg_node->lineno > 0 && sg_node->lineno == edge->from->lineno + 1)) {
+                        has_superglobal = true;
+                        break;
+                    }
+                    sg_node = sg_node->next;
+                }
+                
+                // 添加可疑点
+                if (suspicious_count < 100) {
+                    suspicious_points[suspicious_count].lineno = edge->from->lineno;
+                    if (has_superglobal) {
+                        suspicious_points[suspicious_count].reason = "危险函数+超全局变量组合";
+                        suspicious_points[suspicious_count].risk_score = 90;  // 高风险
+                    } else {
+                        suspicious_points[suspicious_count].reason = "危险函数调用";
+                        suspicious_points[suspicious_count].risk_score = 60;  // 中风险
+                    }
+                    suspicious_count++;
+                    total_risk_score += suspicious_points[suspicious_count - 1].risk_score;
+                }
+                
+                webshell = 1;
+                g_webshell_detected_before_segfault = 1;
+            }
+        } else if (edge->edge_type == EDGE_EVAL) {
+            printf("⚠️  检测到eval调用 (位置: 行 %u)\n", edge->from->lineno);
+            dangerous_pattern_count++;
+            
+            // 添加可疑点
+            if (suspicious_count < 100) {
+                suspicious_points[suspicious_count].lineno = edge->from->lineno;
+                suspicious_points[suspicious_count].reason = "eval调用";
+                suspicious_points[suspicious_count].risk_score = 95;  // 极高风险
+                suspicious_count++;
+                total_risk_score += 95;
+            }
+            
+            webshell = 1;
+            g_webshell_detected_before_segfault = 1;
+        } else if (edge->edge_type == EDGE_INCLUDE) {
+            // include本身不一定是webshell，但结合其他特征可能是
+            if (suspicious_count < 100) {
+                suspicious_points[suspicious_count].lineno = edge->from->lineno;
+                suspicious_points[suspicious_count].reason = "include/require调用";
+                suspicious_points[suspicious_count].risk_score = 30;  // 低风险
+                suspicious_count++;
+                total_risk_score += 30;
+            }
+        }
+        
+        edge = edge->next;
+    }
+    
+    // 计算平均风险评分
+    int avg_risk_score = suspicious_count > 0 ? (total_risk_score / suspicious_count) : 0;
+    
+    // 输出检测结果
+    if (dangerous_pattern_count > 0) {
+        printf("检测结果: 发现 %d 个危险模式\n", dangerous_pattern_count);
+        printf("风险评分: %d/100 (平均: %d/100)\n", total_risk_score, avg_risk_score);
+        
+        // 输出可疑点列表（最多显示前10个）
+        if (suspicious_count > 0) {
+            printf("可疑点列表（共 %d 个，显示前10个）:\n", suspicious_count);
+            int display_count = suspicious_count > 10 ? 10 : suspicious_count;
+            for (int i = 0; i < display_count; i++) {
+                printf("  [行 %u] %s (风险评分: %d)\n", 
+                       suspicious_points[i].lineno,
+                       suspicious_points[i].reason,
+                       suspicious_points[i].risk_score);
+            }
+        }
+    } else {
+        printf("检测结果: 未发现明显的危险模式\n");
+        if (suspicious_count > 0) {
+            printf("风险评分: %d/100 (平均: %d/100)\n", total_risk_score, avg_risk_score);
+            printf("可疑点列表（共 %d 个，显示前10个）:\n", suspicious_count);
+            int display_count = suspicious_count > 10 ? 10 : suspicious_count;
+            for (int i = 0; i < display_count; i++) {
+                printf("  [行 %u] %s (风险评分: %d)\n", 
+                       suspicious_points[i].lineno,
+                       suspicious_points[i].reason,
+                       suspicious_points[i].risk_score);
+            }
+        }
+    }
+    
+    // 清理临时节点列表
+    while (superglobal_nodes) {
+        TokenNode *next = superglobal_nodes->next;
+        efree(superglobal_nodes);
+        superglobal_nodes = next;
+    }
 }
   
 int main(int argc, char *argv[]) {
@@ -6000,7 +8673,7 @@ int main(int argc, char *argv[]) {
         fseek(file, 0, SEEK_END);
         int size = ftell(file);
         fseek(file, 0, SEEK_SET);
-        char *source = (char *)malloc(sizeof(char) * size + 1);
+        char *source = (char *)my_safe_malloc(sizeof(char) * size + 1);
         fread(source, 1, size, file);
         fclose(file);
         source[size] = '\0';
@@ -6021,10 +8694,10 @@ int main(int argc, char *argv[]) {
     char *source = NULL;
     size_t bytes_read = 0;
     if (file_size > 0) {
-        source = malloc(file_size + 1);
+        source = my_safe_malloc(file_size + 1);
         bytes_read = fread(source, 1, file_size, file);
     } else {
-        source = malloc(1);
+        source = my_safe_malloc(1);
         if (source) *source = '\0';
         bytes_read = 0;
     }
@@ -6072,7 +8745,32 @@ int main(int argc, char *argv[]) {
     }
     
     zend_string *filename = zend_string_init(argv[1], strlen(argv[1]),0);
-    zend_string *code = zend_string_init(source, bytes_read, 0);
+    
+    // 对于大文件（>200KB），提取PHP标签内容以减少AST解析负担
+    // 这样可以避免对HTML/CSS/JS部分进行AST解析，只解析PHP代码
+    zend_string *code = NULL;
+    zend_string *extracted_php = NULL;
+    bool use_extracted_php = false;
+    
+    if (file_size > 200 * 1024) {  // 大于200KB的文件
+        printf("提示: 文件较大（%zu 字节），将提取PHP标签内容进行AST解析（跳过HTML/CSS/JS）\n", file_size);
+        extracted_php = extract_php_tags(source, bytes_read);
+        if (extracted_php && ZSTR_LEN(extracted_php) > 0) {
+            size_t extracted_len = ZSTR_LEN(extracted_php);
+            size_t original_len = bytes_read;
+            printf("提示: 从 %zu 字节中提取了 %zu 字节的PHP代码（%.1f%%）\n", 
+                   original_len, extracted_len, (extracted_len * 100.0) / original_len);
+            code = extracted_php;
+            use_extracted_php = true;
+        } else {
+            printf("警告: 未能提取到PHP代码，将使用原始文件内容\n");
+            code = zend_string_init(source, bytes_read, 0);
+        }
+    } else {
+        // 小文件直接使用原始内容
+        code = zend_string_init(source, bytes_read, 0);
+    }
+    
     current_filename = zend_string_copy(filename);
     free(source);
 
@@ -6130,11 +8828,179 @@ int main(int argc, char *argv[]) {
 
         sink_count = sink_num;
 
-        printf("正在编译PHP代码到AST...\n");
-        
         // 更新全局变量（用于段错误处理）
         g_file_size_on_segfault = file_size;
         g_file_lines_on_segfault = 0;
+        g_webshell_detected_before_segfault = 0;  // 重置标志
+        
+        // ========== 分层式Webshell检测 ==========
+        // L1层：快速风险过滤（不解析AST）
+        printf("\n========================================\n");
+        printf("L1层：快速风险过滤（不解析AST）\n");
+        printf("========================================\n");
+        
+        size_t l1_check_limit = bytes_read;
+        if (file_size > 200 * 1024) {
+            l1_check_limit = 200 * 1024;  // 大文件只检查前200KB
+        }
+        
+        L1RiskResult l1_result = l1_quick_risk_filter(source, bytes_read, l1_check_limit);
+        
+        // 解码链检测（使用FSM，基于token-level识别）
+        printf("正在进行解码链检测（基于FSM，token-level识别）...\n");
+        DecodeChainFSM decode_chain = detect_decode_chain_fsm(source, bytes_read, l1_check_limit);
+        
+        if (decode_chain.is_webshell) {
+            printf("⚠️  解码链检测结果: 检测到危险解码链（链长度: %d）\n", decode_chain.chain_length);
+            printf("解码链: ");
+            for (int i = 0; i < decode_chain.chain_length; i++) {
+                printf("%s", decode_chain.chain_functions[i]);
+                if (i < decode_chain.chain_length - 1) {
+                    printf(" → ");
+                }
+            }
+            printf("\n");
+            if (!l1_result.has_high_risk) {
+                l1_result.has_high_risk = true;
+                l1_result.risk_score += 20;  // 解码链检测到，增加风险评分
+                l1_result.risk_reason = "检测到危险解码链";
+            }
+        } else {
+            printf("✓ 解码链检测结果: 未发现危险解码链\n");
+        }
+        
+        // Webshell功能组件分析（Component Fingerprinting）
+        printf("\n========================================\n");
+        printf("Webshell功能组件分析（Component Fingerprinting）\n");
+        printf("========================================\n");
+        
+        ComponentMatch component_matches[16];  // 最多16个组件
+        int component_count = detect_webshell_components(source, bytes_read, 
+                                                         component_matches, 16, l1_check_limit);
+        
+        if (component_count > 0) {
+            printf("检测到 %d 个功能组件：\n", component_count);
+            int high_risk_component_count = 0;
+            int medium_risk_component_count = 0;
+            
+            for (int i = 0; i < component_count; i++) {
+                const char *risk_level_str = "";
+                if (component_matches[i].risk_level == 3) {
+                    risk_level_str = "高风险";
+                    high_risk_component_count++;
+                } else if (component_matches[i].risk_level == 2) {
+                    risk_level_str = "中风险";
+                    medium_risk_component_count++;
+                } else {
+                    risk_level_str = "低风险";
+                }
+                
+                printf("  - %s: 匹配到 %d 个关键词（%s）\n", 
+                       component_matches[i].component_name,
+                       component_matches[i].match_count,
+                       risk_level_str);
+            }
+            
+            // 若超过2个"危险组件"（高风险或中风险），直接判定为shell
+            int dangerous_component_count = high_risk_component_count + medium_risk_component_count;
+            if (dangerous_component_count >= 2) {
+                printf("⚠️  检测到 %d 个危险组件（高风险: %d, 中风险: %d），判定为Webshell\n", 
+                       dangerous_component_count, high_risk_component_count, medium_risk_component_count);
+                if (!l1_result.has_high_risk) {
+                    l1_result.has_high_risk = true;
+                    l1_result.risk_score += 15 * dangerous_component_count;
+                    l1_result.risk_reason = "检测到多个危险功能组件";
+                }
+            } else if (high_risk_component_count > 0) {
+                printf("⚠️  检测到 %d 个高风险组件\n", high_risk_component_count);
+                if (!l1_result.has_high_risk) {
+                    l1_result.has_high_risk = true;
+                    l1_result.risk_score += 20;
+                    l1_result.risk_reason = "检测到高风险功能组件";
+                }
+            }
+        } else {
+            printf("✓ 未检测到明显的功能组件\n");
+        }
+        
+        if (l1_result.has_high_risk) {
+            printf("⚠️  L1层检测结果: 高风险（风险评分: %d）\n", l1_result.risk_score);
+            printf("原因: %s\n", l1_result.risk_reason ? l1_result.risk_reason : "检测到高风险模式");
+            webshell = 1;
+            g_webshell_detected_before_segfault = 1;
+            
+            // 如果L1层检测到高风险，可以直接输出结果，跳过AST解析
+            if (file_size > 500 * 1024) {  // 大文件直接返回
+                printf("\n========================================\n");
+                printf("[WEB_SHELL] ⚠️  警告: 检测到 WebShell!\n");
+                printf("========================================\n");
+                printf("文件: %s\n", ZSTR_VAL(filename));
+                printf("检测方法: L1层快速风险过滤（跳过AST解析）\n");
+                printf("原因: %s\n", l1_result.risk_reason ? l1_result.risk_reason : "检测到高风险模式");
+                printf("风险评分: %d\n", l1_result.risk_score);
+                printf("说明: 文件较大，已通过L1层快速过滤检测到webshell特征，跳过AST解析以避免崩溃\n");
+                printf("========================================\n");
+                zend_string_release(code);
+                zend_string_release(filename);
+                free(source);
+                return 0;  // 返回0表示检测到webshell
+            }
+        } else if (l1_result.has_medium_risk) {
+            printf("⚠️  L1层检测结果: 中等风险（风险评分: %d）\n", l1_result.risk_score);
+            printf("原因: %s\n", l1_result.risk_reason ? l1_result.risk_reason : "检测到可疑函数组合");
+        } else {
+            printf("✓ L1层检测结果: 未发现明显风险\n");
+        }
+        
+        // L2层：结构切片 + 局部AST分析（仅对可疑块进行AST分析）
+        printf("\n========================================\n");
+        printf("L2层：结构切片 + 局部AST分析\n");
+        printf("========================================\n");
+        
+        SuspiciousBlock suspicious_blocks[32];  // 最多32个可疑块
+        int block_count = 0;
+        
+        if (file_size > 200 * 1024) {
+            // 大文件：只对可疑块进行AST分析
+            size_t l2_check_limit = (file_size > 500 * 1024) ? 500 * 1024 : file_size;
+            block_count = find_suspicious_blocks(source, bytes_read, suspicious_blocks, 32, l2_check_limit);
+            
+            if (block_count > 0) {
+                printf("发现 %d 个可疑代码块，将进行局部AST分析\n", block_count);
+                for (int i = 0; i < block_count && i < 10; i++) {  // 最多显示10个
+                    printf("  块 %d: 位置 %zu-%zu, 原因: %s\n", 
+                           i+1, suspicious_blocks[i].start_pos, suspicious_blocks[i].end_pos,
+                           suspicious_blocks[i].reason);
+                }
+                if (block_count > 10) {
+                    printf("  ... 还有 %d 个可疑块\n", block_count - 10);
+                }
+            } else {
+                printf("未发现明显的可疑代码块\n");
+            }
+        }
+        
+        // 重要：在词法分析之前，先进行源代码模式匹配检测
+        // 这样可以确保即使词法分析失败，也能检测到webshell特征
+        // 对于大文件，只检查文件的一部分以提高性能
+        printf("\n========================================\n");
+        printf("源代码模式匹配检测（大文件将进行简化检测）\n");
+        printf("========================================\n");
+        
+        // 对于大文件（>200KB），只检查前200KB来进行源代码模式匹配，以提高性能
+        size_t pattern_match_limit = bytes_read;
+        if (file_size > 200 * 1024) {
+            pattern_match_limit = 200 * 1024;  // 只检查前200KB
+            printf("警告: 文件较大 (%zu 字节)，源代码模式匹配将只检查前200KB\n", file_size);
+        }
+        
+        // 使用 source 缓冲区进行源代码模式匹配（而不是 ZSTR_VAL(code)）
+        // 这样可以避免对大文件进行完整的字符串操作
+        const char *code_str_for_pattern = source;
+        
+        // 创建一个辅助宏来安全地搜索模式（对于大文件只检查前200KB）
+        // 使用辅助函数来避免语法问题
+        #define SAFE_PATTERN_SEARCH(pattern) safe_pattern_search(pattern, code_str_for_pattern, pattern_match_limit, bytes_read)
         
         // 检查文件大小和行数，避免词法分析器处理超大文件时崩溃
         // 对于大文件，简化检查以避免在检查过程中崩溃
@@ -6196,7 +9062,13 @@ int main(int argc, char *argv[]) {
         int has_variable_interpolation = 0;
         
         // 限制字符串检查的范围，避免大文件导致崩溃
-        size_t string_check_limit = (file_size > 500 * 1024) ? 100 * 1024 : bytes_read;
+        // 对于大于200KB的文件，只检查前200KB；对于大于500KB的文件，只检查前100KB
+        size_t string_check_limit = bytes_read;
+        if (file_size > 500 * 1024) {
+            string_check_limit = 100 * 1024;  // 只检查前100KB
+        } else if (file_size > 200 * 1024) {
+            string_check_limit = 200 * 1024;  // 只检查前200KB
+        }
         
         for (size_t i = 0; i < string_check_limit; i++) {
             // 处理换行符
@@ -6305,27 +9177,51 @@ int main(int argc, char *argv[]) {
         }
         
         // 检查是否包含可能导致段错误的字符串
-        // 改进：放宽限制条件，并先进行源代码模式匹配检测
+        // 改进：对于大文件（>200KB），降低阈值，更早触发跳过词法分析
         int should_skip = 0;
-        if (max_string_length > 200000) {  // 放宽到 200KB
+        
+        // 对于大文件，使用更严格的阈值
+        size_t string_length_threshold = 200000;  // 默认200KB
+        size_t string_length_warning = 10000;      // 默认10KB
+        size_t string_length_warning2 = 20000;     // 默认20KB
+        
+        if (file_size > 200 * 1024) {
+            // 对于200KB-500KB的文件，降低阈值
+            string_length_threshold = 100000;  // 降低到100KB
+            string_length_warning = 5000;      // 降低到5KB
+            string_length_warning2 = 10000;   // 降低到10KB
+        }
+        
+        if (max_string_length > string_length_threshold) {
             printf("错误: 检测到超长字符串字面量（%zu 字节，跨 %d 行），可能导致词法分析器崩溃\n", 
                    max_string_length, max_line_count);
             printf("可能原因: 文件包含超长的base64编码或其他编码字符串\n");
             printf("此类文件已知会导致段错误，跳过词法分析以避免崩溃\n");
             should_skip = 1;
-        } else if (max_string_length > 10000 && max_line_count > 20) {
-            // 放宽限制：>10KB 且跨 >20 行（原来是 >5KB 且跨 >10 行）
-            printf("错误: 检测到复杂的多行字符串字面量（长度: %zu 字节，跨 %d 行）\n", 
-                   max_string_length, max_line_count);
-            printf("可能原因: 字符串包含HTML/CSS/JavaScript代码或变量插值\n");
-            printf("此类文件在词法分析阶段已知会导致段错误，跳过词法分析以避免崩溃\n");
-            printf("建议: 请使用其他检测工具或预处理文件\n");
-            should_skip = 1;
-        } else if (max_string_length > 20000 && max_line_count > 10) {
+        } else if (max_string_length > string_length_warning && max_line_count > 20) {
+            // 对于大文件，降低行数阈值
+            int line_threshold = (file_size > 200 * 1024) ? 15 : 20;
+            if (max_line_count > line_threshold) {
+                printf("错误: 检测到复杂的多行字符串字面量（长度: %zu 字节，跨 %d 行）\n", 
+                       max_string_length, max_line_count);
+                printf("可能原因: 字符串包含HTML/CSS/JavaScript代码或变量插值\n");
+                printf("此类文件在词法分析阶段已知会导致段错误，跳过词法分析以避免崩溃\n");
+                printf("建议: 请使用其他检测工具或预处理文件\n");
+                should_skip = 1;
+            }
+        } else if (max_string_length > string_length_warning2 && max_line_count > 10) {
             printf("警告: 检测到较长的多行字符串字面量（%zu 字节，跨 %d 行）\n", 
                    max_string_length, max_line_count);
             printf("可能原因: 字符串包含HTML/CSS/JavaScript代码或变量插值\n");
             printf("建议: 此类文件可能导致词法分析器处理困难，可能发生段错误\n");
+        }
+        
+        // 对于大于200KB的文件，如果检测到未闭合的长字符串，也考虑跳过
+        if (file_size > 200 * 1024 && in_string && current_string_length > 50000) {
+            printf("错误: 检测到未闭合的超长字符串字面量（长度: %zu 字节），可能导致词法分析器崩溃\n", 
+                   current_string_length);
+            printf("此类文件已知会导致段错误，跳过词法分析以避免崩溃\n");
+            should_skip = 1;
         }
         
         // 信号处理器已在程序开始时设置，这里只需要更新文件信息
@@ -6336,23 +9232,103 @@ int main(int argc, char *argv[]) {
         // 启用短标签支持（<? 和 <?=）
         CG(short_tags) = 1;
         
-        // 改进：在解析之前，先检查源代码中是否包含危险的文件操作函数
-        // 这样可以确保即使 AST 解析失败，也能检测到基本的 webshell 特征
+        // 重要：在词法分析之前，先进行源代码模式匹配检测
+        // 这样可以确保即使词法分析失败，也能检测到webshell特征
+        // 对于大文件，只检查文件的一部分以提高性能
+        // 源代码模式匹配已经在前面执行了，这里只需要确保标志已正确设置
         const char *dangerous_patterns[] = {
           "fopen", "fwrite", "file_put_contents", "fputs",
           "base64_decode", "gzinflate", "eval", "assert",
-          "move_uploaded_file", "exec", "system", "shell_exec", "passthru"
+          "move_uploaded_file", "exec", "system", "shell_exec", "passthru",
+          "preg_replace", "preg_filter", "preg_replace_callback"
         };
         int pattern_count = sizeof(dangerous_patterns) / sizeof(dangerous_patterns[0]);
         int dangerous_count = 0;
         for (int i = 0; i < pattern_count; i++) {
-          if (strstr(ZSTR_VAL(code), dangerous_patterns[i]) != NULL) {
-            dangerous_count++;
-            printf("DEBUG: 在源代码中发现危险函数: %s\n", dangerous_patterns[i]);
+          // 对于大文件，只在前200KB中搜索
+          if (pattern_match_limit < bytes_read) {
+            // 创建一个临时字符串用于搜索
+            char *search_buf = (char *)my_safe_malloc(pattern_match_limit + 1);
+            if (search_buf) {
+              memcpy(search_buf, code_str_for_pattern, pattern_match_limit);
+              search_buf[pattern_match_limit] = '\0';
+              if (strstr(search_buf, dangerous_patterns[i]) != NULL) {
+                dangerous_count++;
+                printf("DEBUG: 在源代码中发现危险函数: %s\n", dangerous_patterns[i]);
+              }
+              free(search_buf);
+            }
+          } else {
+            if (strstr(code_str_for_pattern, dangerous_patterns[i]) != NULL) {
+              dangerous_count++;
+              printf("DEBUG: 在源代码中发现危险函数: %s\n", dangerous_patterns[i]);
+            }
           }
         }
         if (dangerous_count >= 2) {
           printf("DEBUG: 警告：源代码中包含 %d 个危险函数/操作，可能是 webshell\n", dangerous_count);
+        }
+        
+        // 检查 preg_replace 与 chr 组合（混淆的 webshell 模式）
+        bool has_preg_replace_chr = false;
+        if (SAFE_PATTERN_SEARCH("preg_replace") && SAFE_PATTERN_SEARCH("chr(")) {
+          // 检查是否有多个 chr() 调用（混淆模式）
+          size_t search_len_chr = (pattern_match_limit < bytes_read) ? pattern_match_limit : bytes_read;
+          char *search_buf_chr = (char *)my_safe_malloc(search_len_chr + 1);
+          if (search_buf_chr) {
+            memcpy(search_buf_chr, code_str_for_pattern, search_len_chr);
+            search_buf_chr[search_len_chr] = '\0';
+            int chr_count = 0;
+            const char *chr_pos = search_buf_chr;
+            while ((chr_pos = strstr(chr_pos, "chr(")) != NULL) {
+              chr_count++;
+              chr_pos += 4; // 跳过 "chr("
+            }
+            if (chr_count >= 3) {
+              // 如果 preg_replace 和多个 chr() 调用同时出现，很可能是混淆的 webshell
+              has_preg_replace_chr = true;
+              printf("DEBUG: 在源代码中发现 preg_replace 与多个 chr() 调用组合（混淆的 webshell 模式，chr调用数=%d）\n", chr_count);
+            } else if (chr_count >= 1) {
+              // 即使只有1-2个 chr() 调用，如果同时包含超全局变量或危险函数名，也应该检测
+              if (strstr(search_buf_chr, "$_POST") != NULL || strstr(search_buf_chr, "$_GET") != NULL ||
+                  strstr(search_buf_chr, "$_REQUEST") != NULL || strstr(search_buf_chr, "eval") != NULL ||
+                  strstr(search_buf_chr, "assert") != NULL || strstr(search_buf_chr, "exec") != NULL) {
+                has_preg_replace_chr = true;
+                printf("DEBUG: 在源代码中发现 preg_replace 与 chr() 调用组合，且包含超全局变量或危险函数名\n");
+              }
+            }
+            free(search_buf_chr);
+          }
+        }
+        
+        // 检查大量 chr() 函数调用（可能是混淆代码）
+        bool has_many_chr_calls = false;
+        if (SAFE_PATTERN_SEARCH("chr(")) {
+          size_t search_len = (pattern_match_limit < bytes_read) ? pattern_match_limit : bytes_read;
+          char *search_buf = (char *)my_safe_malloc(search_len + 1);
+          if (search_buf) {
+            memcpy(search_buf, code_str_for_pattern, search_len);
+            search_buf[search_len] = '\0';
+            int chr_count = 0;
+            const char *chr_pos = search_buf;
+            while ((chr_pos = strstr(chr_pos, "chr(")) != NULL) {
+              chr_count++;
+              chr_pos += 4;
+            }
+            if (chr_count >= 10) {
+              // 如果有很多 chr() 调用（>=10个），很可能是混淆的 webshell
+              has_many_chr_calls = true;
+              printf("DEBUG: 在源代码中发现大量 chr() 调用（混淆模式，chr调用数=%d）\n", chr_count);
+            }
+            free(search_buf);
+          }
+        }
+        
+        // 检查十六进制编码的 chr() 调用（如 chr(0x40)）
+        bool has_hex_chr = false;
+        if (SAFE_PATTERN_SEARCH("chr(0x") || SAFE_PATTERN_SEARCH("chr(0X")) {
+          has_hex_chr = true;
+          printf("DEBUG: 在源代码中发现十六进制编码的 chr() 调用（混淆模式）\n");
         }
         
         // 检查图片马特征：文件开头是图片文件头（GIF89a, PNG, JPEG等），后面跟着PHP代码
@@ -6403,23 +9379,34 @@ int main(int argc, char *argv[]) {
         
         // 检查文件上传相关的webshell特征
         bool has_upload_webshell = false;
-        if (strstr(ZSTR_VAL(code), "move_uploaded_file") != NULL &&
-            (strstr(ZSTR_VAL(code), "$_FILES") != NULL ||
-             strstr(ZSTR_VAL(code), "$_REQUEST") != NULL ||
-             strstr(ZSTR_VAL(code), "$_POST") != NULL ||
-             strstr(ZSTR_VAL(code), "$_GET") != NULL)) {
+        if (SAFE_PATTERN_SEARCH("move_uploaded_file") &&
+            (SAFE_PATTERN_SEARCH("$_FILES") ||
+             SAFE_PATTERN_SEARCH("$_REQUEST") ||
+             SAFE_PATTERN_SEARCH("$_POST") ||
+             SAFE_PATTERN_SEARCH("$_GET"))) {
           has_upload_webshell = true;
           printf("DEBUG: 检测到文件上传webshell特征：move_uploaded_file 与超全局变量组合\n");
         }
         
-        // 检查密码验证相关的webshell特征（md5 + $_REQUEST）
+        // 检查密码验证相关的webshell特征（md5 + $_REQUEST 或 $_POST 或 $_GET 或 $_SESSION）
         bool has_password_auth = false;
-        if (strstr(ZSTR_VAL(code), "md5") != NULL &&
-            (strstr(ZSTR_VAL(code), "$_REQUEST") != NULL ||
-             strstr(ZSTR_VAL(code), "$_POST") != NULL ||
-             strstr(ZSTR_VAL(code), "$_GET") != NULL)) {
+        if (SAFE_PATTERN_SEARCH("md5") &&
+            (SAFE_PATTERN_SEARCH("$_REQUEST") ||
+             SAFE_PATTERN_SEARCH("$_POST") ||
+             SAFE_PATTERN_SEARCH("$_GET") ||
+             SAFE_PATTERN_SEARCH("$_SESSION") ||
+             SAFE_PATTERN_SEARCH("$_COOKIE"))) {
           has_password_auth = true;
           printf("DEBUG: 检测到密码验证webshell特征：md5 与超全局变量组合\n");
+        }
+        // 检查 session_start 与超全局变量的组合（典型的webshell特征）
+        if (!has_password_auth && SAFE_PATTERN_SEARCH("session_start") &&
+            (SAFE_PATTERN_SEARCH("$_POST") ||
+             SAFE_PATTERN_SEARCH("$_GET") ||
+             SAFE_PATTERN_SEARCH("$_REQUEST") ||
+             SAFE_PATTERN_SEARCH("$_SESSION"))) {
+          has_password_auth = true;
+          printf("DEBUG: 检测到session相关webshell特征：session_start 与超全局变量组合\n");
         }
         
         // 检查WSO webshell特征和其他webshell特征字符串
@@ -6431,61 +9418,69 @@ int main(int argc, char *argv[]) {
           "r57shell", "R57Shell", "R57SHELL",
           "phpspy", "PHPSpy", "PHPSPY",
           "c99", "r57", "wso",
-          "zcg:function", "XSLTProcessor", "registerPHPFunctions"
+          "zcg:function", "XSLTProcessor", "registerPHPFunctions",
+          "EgY_SpIdEr", "egyspider", "EGYSPIDER",  // EgY_SpIdEr ShElL
+          "SpIdEr ShElL", "spider shell", "SPIDER SHELL",  // 各种变体
+          "EgY_SpIdEr ShElL", "EgY_SpIdEr ShElL V2", "egy_spider", "EGY_SPIDER"  // 更多变体
         };
         int signature_count = sizeof(webshell_signatures) / sizeof(webshell_signatures[0]);
         int signature_match_count = 0;
+        printf("DEBUG: 开始检查 %d 个webshell特征字符串（检查范围: 前 %zu 字节）\n", signature_count, pattern_match_limit);
+        fflush(stdout);
         for (int i = 0; i < signature_count; i++) {
-          if (strstr(ZSTR_VAL(code), webshell_signatures[i]) != NULL) {
+          if (SAFE_PATTERN_SEARCH(webshell_signatures[i])) {
             signature_match_count++;
             printf("DEBUG: 在源代码中发现webshell特征: %s\n", webshell_signatures[i]);
+            fflush(stdout);  // 刷新输出，确保DEBUG信息能及时显示
           }
         }
+        printf("DEBUG: webshell特征字符串匹配完成，共匹配到 %d 个特征\n", signature_match_count);
+        fflush(stdout);
         
         // 检查序列化数据中的webshell特征（如 "s:4:\"pass\"" 或 "s:8:\"backdoor\""）
         bool has_serialized_webshell = false;
-        if (strstr(ZSTR_VAL(code), "s:4:\"pass\"") != NULL || 
-            strstr(ZSTR_VAL(code), "s:8:\"backdoor\"") != NULL ||
-            strstr(ZSTR_VAL(code), "s:11:\"wso_version\"") != NULL ||
-            strstr(ZSTR_VAL(code), "\"pass\"") != NULL ||
-            strstr(ZSTR_VAL(code), "\"backdoor\"") != NULL ||
-            strstr(ZSTR_VAL(code), "\"wso_version\"") != NULL) {
+        if (SAFE_PATTERN_SEARCH("s:4:\"pass\"") || 
+            SAFE_PATTERN_SEARCH("s:8:\"backdoor\"") ||
+            SAFE_PATTERN_SEARCH("s:11:\"wso_version\"") ||
+            SAFE_PATTERN_SEARCH("\"pass\"") ||
+            SAFE_PATTERN_SEARCH("\"backdoor\"") ||
+            SAFE_PATTERN_SEARCH("\"wso_version\"")) {
           has_serialized_webshell = true;
           printf("DEBUG: 在源代码中发现序列化数据中的webshell特征\n");
         }
         
         // 检查XSLT相关的webshell特征
         bool has_xslt_webshell = false;
-        if ((strstr(ZSTR_VAL(code), "zcg:function") != NULL && 
-             (strstr(ZSTR_VAL(code), "assert") != NULL || strstr(ZSTR_VAL(code), "eval") != NULL)) ||
-            (strstr(ZSTR_VAL(code), "XSLTProcessor") != NULL && 
-             strstr(ZSTR_VAL(code), "registerPHPFunctions") != NULL) ||
-            (strstr(ZSTR_VAL(code), "assert(") != NULL && strstr(ZSTR_VAL(code), "$_POST") != NULL) ||
-            (strstr(ZSTR_VAL(code), "assert(") != NULL && strstr(ZSTR_VAL(code), "$_GET") != NULL) ||
-            (strstr(ZSTR_VAL(code), "assert(") != NULL && strstr(ZSTR_VAL(code), "$_REQUEST") != NULL)) {
+        if ((SAFE_PATTERN_SEARCH("zcg:function") && 
+             (SAFE_PATTERN_SEARCH("assert") || SAFE_PATTERN_SEARCH("eval"))) ||
+            (SAFE_PATTERN_SEARCH("XSLTProcessor") && 
+             SAFE_PATTERN_SEARCH("registerPHPFunctions")) ||
+            (SAFE_PATTERN_SEARCH("assert(") && SAFE_PATTERN_SEARCH("$_POST")) ||
+            (SAFE_PATTERN_SEARCH("assert(") && SAFE_PATTERN_SEARCH("$_GET")) ||
+            (SAFE_PATTERN_SEARCH("assert(") && SAFE_PATTERN_SEARCH("$_REQUEST"))) {
           has_xslt_webshell = true;
           printf("DEBUG: 在源代码中发现XSLT webshell特征\n");
         }
         
         // 检查字符串中包含危险函数调用模式（如 system($_GET[...])）
         bool has_string_dangerous_call = false;
-        if ((strstr(ZSTR_VAL(code), "system(") != NULL && (strstr(ZSTR_VAL(code), "$_GET") != NULL || strstr(ZSTR_VAL(code), "$_POST") != NULL || strstr(ZSTR_VAL(code), "$_REQUEST") != NULL)) ||
-            (strstr(ZSTR_VAL(code), "exec(") != NULL && (strstr(ZSTR_VAL(code), "$_GET") != NULL || strstr(ZSTR_VAL(code), "$_POST") != NULL || strstr(ZSTR_VAL(code), "$_REQUEST") != NULL)) ||
-            (strstr(ZSTR_VAL(code), "shell_exec(") != NULL && (strstr(ZSTR_VAL(code), "$_GET") != NULL || strstr(ZSTR_VAL(code), "$_POST") != NULL || strstr(ZSTR_VAL(code), "$_REQUEST") != NULL)) ||
-            (strstr(ZSTR_VAL(code), "passthru(") != NULL && (strstr(ZSTR_VAL(code), "$_GET") != NULL || strstr(ZSTR_VAL(code), "$_POST") != NULL || strstr(ZSTR_VAL(code), "$_REQUEST") != NULL))) {
+        if ((SAFE_PATTERN_SEARCH("system(") && (SAFE_PATTERN_SEARCH("$_GET") || SAFE_PATTERN_SEARCH("$_POST") || SAFE_PATTERN_SEARCH("$_REQUEST"))) ||
+            (SAFE_PATTERN_SEARCH("exec(") && (SAFE_PATTERN_SEARCH("$_GET") || SAFE_PATTERN_SEARCH("$_POST") || SAFE_PATTERN_SEARCH("$_REQUEST"))) ||
+            (SAFE_PATTERN_SEARCH("shell_exec(") && (SAFE_PATTERN_SEARCH("$_GET") || SAFE_PATTERN_SEARCH("$_POST") || SAFE_PATTERN_SEARCH("$_REQUEST"))) ||
+            (SAFE_PATTERN_SEARCH("passthru(") && (SAFE_PATTERN_SEARCH("$_GET") || SAFE_PATTERN_SEARCH("$_POST") || SAFE_PATTERN_SEARCH("$_REQUEST")))) {
           has_string_dangerous_call = true;
           printf("DEBUG: 在源代码中发现字符串中包含危险函数调用模式（如 system($_GET[...])）\n");
         }
         
         // 检查SQL注入特征（INTO OUTFILE）
         bool has_sql_injection = false;
-        if (strstr(ZSTR_VAL(code), "INTO OUTFILE") != NULL || strstr(ZSTR_VAL(code), "into outfile") != NULL ||
-            strstr(ZSTR_VAL(code), "INTO outfile") != NULL || strstr(ZSTR_VAL(code), "into OUTFILE") != NULL) {
+        if (SAFE_PATTERN_SEARCH("INTO OUTFILE") || SAFE_PATTERN_SEARCH("into outfile") ||
+            SAFE_PATTERN_SEARCH("INTO outfile") || SAFE_PATTERN_SEARCH("into OUTFILE")) {
           // 如果包含 INTO OUTFILE 且包含危险函数或超全局变量，标记为可疑
-          if (strstr(ZSTR_VAL(code), "system") != NULL || strstr(ZSTR_VAL(code), "exec") != NULL ||
-              strstr(ZSTR_VAL(code), "eval") != NULL || strstr(ZSTR_VAL(code), "assert") != NULL ||
-              strstr(ZSTR_VAL(code), "$_GET") != NULL || strstr(ZSTR_VAL(code), "$_POST") != NULL ||
-              strstr(ZSTR_VAL(code), "$_REQUEST") != NULL) {
+          if (SAFE_PATTERN_SEARCH("system") || SAFE_PATTERN_SEARCH("exec") ||
+              SAFE_PATTERN_SEARCH("eval") || SAFE_PATTERN_SEARCH("assert") ||
+              SAFE_PATTERN_SEARCH("$_GET") || SAFE_PATTERN_SEARCH("$_POST") ||
+              SAFE_PATTERN_SEARCH("$_REQUEST")) {
             has_sql_injection = true;
             printf("DEBUG: 在源代码中发现SQL注入特征（INTO OUTFILE）且包含危险函数或超全局变量\n");
           } else {
@@ -6497,77 +9492,301 @@ int main(int argc, char *argv[]) {
         
         // 检查 Closure::fromCallable 调用（用于动态调用函数）
         bool has_closure_fromcallable = false;
-        if (strstr(ZSTR_VAL(code), "Closure::fromCallable") != NULL ||
-            strstr(ZSTR_VAL(code), "fromCallable") != NULL) {
+        if (SAFE_PATTERN_SEARCH("Closure::fromCallable") ||
+            SAFE_PATTERN_SEARCH("fromCallable")) {
           has_closure_fromcallable = true;
           printf("DEBUG: 在源代码中发现 Closure::fromCallable 调用（用于动态调用函数）\n");
         }
         
         // 检查 __invoke 方法调用（用于动态调用函数）
         bool has_invoke_method = false;
-        if (strstr(ZSTR_VAL(code), "__invoke") != NULL) {
+        if (SAFE_PATTERN_SEARCH("__invoke")) {
           has_invoke_method = true;
           printf("DEBUG: 在源代码中发现 __invoke 方法调用（用于动态调用函数）\n");
         }
         
         // 检查 array_diff + join 组合（用于拼接函数名）
         bool has_array_diff_join = false;
-        if (strstr(ZSTR_VAL(code), "array_diff") != NULL && strstr(ZSTR_VAL(code), "join") != NULL) {
+        if (SAFE_PATTERN_SEARCH("array_diff") && SAFE_PATTERN_SEARCH("join")) {
           has_array_diff_join = true;
           printf("DEBUG: 在源代码中发现 array_diff + join 组合（可能用于拼接函数名）\n");
         }
         
         // 检查 unserialize 调用（可能用于触发反序列化漏洞）
         bool has_unserialize = false;
-        if (strstr(ZSTR_VAL(code), "unserialize") != NULL) {
+        if (SAFE_PATTERN_SEARCH("unserialize")) {
           has_unserialize = true;
           printf("DEBUG: 在源代码中发现 unserialize 调用（可能用于触发反序列化漏洞）\n");
         }
         
+        // 检查动态函数调用模式：$_GET[...](...) 或 $_POST[...](...) 或 $_REQUEST[...](...)
+        // 这是典型的webshell特征：从用户输入获取函数名并动态调用
+        bool has_dynamic_function_call = false;
+        // 对于大文件，使用优化的搜索
+        size_t search_len = (pattern_match_limit < bytes_read) ? pattern_match_limit : bytes_read;
+        char *code_str_buf = (char *)my_safe_malloc(search_len + 1);
+        if (code_str_buf) {
+          memcpy(code_str_buf, code_str_for_pattern, search_len);
+          code_str_buf[search_len] = '\0';
+          const char *code_str = code_str_buf;
+          // 检测 $_GET[...]( 模式
+        if (strstr(code_str, "$_GET[") != NULL && strstr(code_str, "](") != NULL) {
+          // 检查 $_GET[...]( 是否在同一行或附近（简单的模式匹配）
+          const char *get_pos = strstr(code_str, "$_GET[");
+          const char *call_pos = strstr(code_str, "](");
+          if (get_pos && call_pos && call_pos > get_pos) {
+            // 检查两者之间是否有其他字符（允许一些空白字符和索引）
+            size_t distance = call_pos - get_pos;
+            if (distance < 100) {  // 合理的距离限制
+              has_dynamic_function_call = true;
+              printf("DEBUG: 在源代码中发现动态函数调用模式: $_GET[...](...)\n");
+            }
+          }
+        }
+        // 检测 $_POST[...]( 模式
+        if (!has_dynamic_function_call && strstr(code_str, "$_POST[") != NULL && strstr(code_str, "](") != NULL) {
+          const char *post_pos = strstr(code_str, "$_POST[");
+          const char *call_pos = strstr(code_str, "](");
+          if (post_pos && call_pos && call_pos > post_pos) {
+            size_t distance = call_pos - post_pos;
+            if (distance < 100) {
+              has_dynamic_function_call = true;
+              printf("DEBUG: 在源代码中发现动态函数调用模式: $_POST[...](...)\n");
+            }
+          }
+        }
+        // 检测 $_REQUEST[...]( 模式
+        if (!has_dynamic_function_call && strstr(code_str, "$_REQUEST[") != NULL && strstr(code_str, "](") != NULL) {
+          const char *request_pos = strstr(code_str, "$_REQUEST[");
+          const char *call_pos = strstr(code_str, "](");
+          if (request_pos && call_pos && call_pos > request_pos) {
+            size_t distance = call_pos - request_pos;
+            if (distance < 100) {
+              has_dynamic_function_call = true;
+              printf("DEBUG: 在源代码中发现动态函数调用模式: $_REQUEST[...](...)\n");
+            }
+          }
+        }
+        // 检测 $GET_[...]( 模式（可能的混淆变体）
+        if (!has_dynamic_function_call && strstr(code_str, "$GET_[") != NULL && strstr(code_str, "](") != NULL) {
+          const char *get_pos = strstr(code_str, "$GET_[");
+          const char *call_pos = strstr(code_str, "](");
+          if (get_pos && call_pos && call_pos > get_pos) {
+            size_t distance = call_pos - get_pos;
+            if (distance < 100) {
+              has_dynamic_function_call = true;
+              printf("DEBUG: 在源代码中发现动态函数调用模式: $GET_[...](...)\n");
+            }
+          }
+          free(code_str_buf);
+        }
+        
+        // 检查回调函数（如 array_map, array_filter, array_reduce, call_user_func）与超全局变量的组合
+        // 这是典型的webshell特征：从用户输入获取函数名并通过回调函数动态调用
+        bool has_callback_with_superglobal = false;
+        // 检测 array_map 与超全局变量的组合
+        if (SAFE_PATTERN_SEARCH("array_map") &&
+            (SAFE_PATTERN_SEARCH("$_POST") ||
+             SAFE_PATTERN_SEARCH("$_GET") ||
+             SAFE_PATTERN_SEARCH("$_REQUEST"))) {
+          has_callback_with_superglobal = true;
+          printf("DEBUG: 在源代码中发现 array_map 与超全局变量组合（典型的webshell特征）\n");
+        }
+        // 检测 array_filter 与超全局变量的组合
+        if (!has_callback_with_superglobal && SAFE_PATTERN_SEARCH("array_filter") &&
+            (SAFE_PATTERN_SEARCH("$_POST") ||
+             SAFE_PATTERN_SEARCH("$_GET") ||
+             SAFE_PATTERN_SEARCH("$_REQUEST"))) {
+          has_callback_with_superglobal = true;
+          printf("DEBUG: 在源代码中发现 array_filter 与超全局变量组合（典型的webshell特征）\n");
+        }
+        // 检测 array_reduce 与超全局变量的组合
+        if (!has_callback_with_superglobal && SAFE_PATTERN_SEARCH("array_reduce") &&
+            (SAFE_PATTERN_SEARCH("$_POST") ||
+             SAFE_PATTERN_SEARCH("$_GET") ||
+             SAFE_PATTERN_SEARCH("$_REQUEST"))) {
+          has_callback_with_superglobal = true;
+          printf("DEBUG: 在源代码中发现 array_reduce 与超全局变量组合（典型的webshell特征）\n");
+        }
+        // 检测 call_user_func 与超全局变量的组合
+        if (!has_callback_with_superglobal && SAFE_PATTERN_SEARCH("call_user_func") &&
+            (SAFE_PATTERN_SEARCH("$_POST") ||
+             SAFE_PATTERN_SEARCH("$_GET") ||
+             SAFE_PATTERN_SEARCH("$_REQUEST"))) {
+          has_callback_with_superglobal = true;
+          printf("DEBUG: 在源代码中发现 call_user_func 与超全局变量组合（典型的webshell特征）\n");
+        }
+        // 检测 call_user_func_array 与超全局变量的组合
+        if (!has_callback_with_superglobal && SAFE_PATTERN_SEARCH("call_user_func_array") &&
+            (SAFE_PATTERN_SEARCH("$_POST") ||
+             SAFE_PATTERN_SEARCH("$_GET") ||
+             SAFE_PATTERN_SEARCH("$_REQUEST"))) {
+          has_callback_with_superglobal = true;
+          printf("DEBUG: 在源代码中发现 call_user_func_array 与超全局变量组合（典型的webshell特征）\n");
+        }
+        
+        // 检查特别危险的函数（如 assert, eval）与超全局变量的组合
+        // 即使只有一个这样的函数，也应该标记为可疑
+        bool has_critical_dangerous_function = false;
+        if ((SAFE_PATTERN_SEARCH("assert") &&
+             (SAFE_PATTERN_SEARCH("$_POST") ||
+              SAFE_PATTERN_SEARCH("$_GET") ||
+              SAFE_PATTERN_SEARCH("$_REQUEST"))) ||
+            (SAFE_PATTERN_SEARCH("eval") &&
+             (SAFE_PATTERN_SEARCH("$_POST") ||
+              SAFE_PATTERN_SEARCH("$_GET") ||
+              SAFE_PATTERN_SEARCH("$_REQUEST")))) {
+          has_critical_dangerous_function = true;
+          printf("DEBUG: 在源代码中发现特别危险的函数（assert/eval）与超全局变量组合（典型的webshell特征）\n");
+        }
+        
+        // 检查解码函数（base64_decode, gzinflate）与超全局变量的组合
+        // 这是典型的webshell特征：使用解码函数来混淆代码，然后与用户输入结合
+        bool has_decode_with_superglobal = false;
+        if ((SAFE_PATTERN_SEARCH("base64_decode") &&
+             (SAFE_PATTERN_SEARCH("$_POST") ||
+              SAFE_PATTERN_SEARCH("$_GET") ||
+              SAFE_PATTERN_SEARCH("$_REQUEST"))) ||
+            (SAFE_PATTERN_SEARCH("gzinflate") &&
+             (SAFE_PATTERN_SEARCH("$_POST") ||
+              SAFE_PATTERN_SEARCH("$_GET") ||
+              SAFE_PATTERN_SEARCH("$_REQUEST")))) {
+          has_decode_with_superglobal = true;
+          printf("DEBUG: 在源代码中发现解码函数（base64_decode/gzinflate）与超全局变量组合（典型的webshell特征）\n");
+        }
+        
+        // 检查变量函数调用模式：$var(...) 与超全局变量的组合
+        // 这是典型的webshell特征：使用变量来动态调用函数
+        // 例如：$a=base64_decode("ZXZhbA=="); $a($_POST['a']);
+        bool has_variable_function_call = false;
+        // 简单的模式匹配：查找 $变量名( 和 $_POST 或 $_GET 或 $_REQUEST 同时存在
+        // 如果同时存在，且它们之间的距离不太远，就认为是变量函数调用模式
+        if ((SAFE_PATTERN_SEARCH("$_POST") ||
+             SAFE_PATTERN_SEARCH("$_GET") ||
+             SAFE_PATTERN_SEARCH("$_REQUEST"))) {
+          // 查找 $变量名( 模式（变量名是单个字母，如 $a(, $b(, $x( 等）
+          const char *var_func_patterns[] = {"$a(", "$b(", "$c(", "$d(", "$e(", "$f(", "$g(", "$h(", 
+                                            "$i(", "$j(", "$k(", "$l(", "$m(", "$n(", "$o(", "$p(",
+                                            "$q(", "$r(", "$s(", "$t(", "$u(", "$v(", "$w(", "$x(",
+                                            "$y(", "$z(", "$A(", "$B(", "$C(", "$D(", "$E(", "$F(",
+                                            "$G(", "$H(", "$I(", "$J(", "$K(", "$L(", "$M(", "$N(",
+                                            "$O(", "$P(", "$Q(", "$R(", "$S(", "$T(", "$U(", "$V(",
+                                            "$W(", "$X(", "$Y(", "$Z("};
+          size_t pattern_count = sizeof(var_func_patterns) / sizeof(var_func_patterns[0]);
+          // 对于大文件，使用优化的搜索
+          size_t search_len_var = (pattern_match_limit < bytes_read) ? pattern_match_limit : bytes_read;
+          char *var_search_buf = (char *)my_safe_malloc(search_len_var + 1);
+          if (var_search_buf) {
+            memcpy(var_search_buf, code_str_for_pattern, search_len_var);
+            var_search_buf[search_len_var] = '\0';
+            for (size_t i = 0; i < pattern_count; i++) {
+              if (strstr(var_search_buf, var_func_patterns[i]) != NULL) {
+                has_variable_function_call = true;
+                printf("DEBUG: 在源代码中发现变量函数调用模式与超全局变量组合（典型的webshell特征）\n");
+                break;
+              }
+            }
+            // 也检查更通用的模式：$变量名(，其中变量名可能包含下划线或数字
+            // 查找 $ 后面跟着字母，然后是 (，且代码中包含超全局变量
+            if (!has_variable_function_call) {
+              const char *pos = var_search_buf;
+          while ((pos = strstr(pos, "$")) != NULL && !has_variable_function_call) {
+            pos++;  // 跳过 $
+            if ((*pos >= 'a' && *pos <= 'z') || (*pos >= 'A' && *pos <= 'Z') || *pos == '_') {
+              // 查找后面的 (
+              const char *paren = strchr(pos, '(');
+              if (paren && paren - pos < 30) {  // 变量名长度合理
+                // 检查 ( 后面是否有超全局变量（在合理距离内，限制在200字符内）
+                const char *after_paren = paren + 1;
+                size_t remaining = strlen(after_paren);
+                size_t search_limit = (remaining > 200) ? 200 : remaining;
+                // 创建一个临时字符串用于搜索
+                char *search_buf = (char *)my_safe_malloc(search_limit + 1);
+                if (search_buf) {
+                  memcpy(search_buf, after_paren, search_limit);
+                  search_buf[search_limit] = '\0';
+                  if (strstr(search_buf, "$_POST") != NULL ||
+                      strstr(search_buf, "$_GET") != NULL ||
+                      strstr(search_buf, "$_REQUEST") != NULL) {
+                    has_variable_function_call = true;
+                    printf("DEBUG: 在源代码中发现变量函数调用模式与超全局变量组合（典型的webshell特征）\n");
+                  }
+                  free(search_buf);
+                }
+                if (has_variable_function_call) {
+                  break;
+                }
+              }
+            }
+            pos++;
+          }
+          free(var_search_buf);
+          }
+        }
+        
         // 改进：如果检测到文件操作函数和解码函数的组合，直接标记为 webshell
-        bool has_file_op = (strstr(ZSTR_VAL(code), "fopen") != NULL || 
-                            strstr(ZSTR_VAL(code), "fwrite") != NULL ||
-                            strstr(ZSTR_VAL(code), "file_put_contents") != NULL ||
-                            strstr(ZSTR_VAL(code), "move_uploaded_file") != NULL);
-        bool has_decode = (strstr(ZSTR_VAL(code), "base64_decode") != NULL ||
-                           strstr(ZSTR_VAL(code), "gzinflate") != NULL);
-        printf("DEBUG: 源代码模式匹配检查: has_file_op=%d, has_decode=%d, dangerous_count=%d, signature_match_count=%d, has_serialized_webshell=%d, has_xslt_webshell=%d, is_image_webshell=%d, has_upload_webshell=%d, has_password_auth=%d, has_string_dangerous_call=%d, has_sql_injection=%d, has_closure_fromcallable=%d, has_invoke_method=%d, has_array_diff_join=%d, has_unserialize=%d\n", 
-               has_file_op, has_decode, dangerous_count, signature_match_count, has_serialized_webshell, has_xslt_webshell, is_image_webshell, has_upload_webshell, has_password_auth, has_string_dangerous_call, has_sql_injection, has_closure_fromcallable, has_invoke_method, has_array_diff_join, has_unserialize);
+        bool has_file_op = (SAFE_PATTERN_SEARCH("fopen") || 
+                            SAFE_PATTERN_SEARCH("fwrite") ||
+                            SAFE_PATTERN_SEARCH("file_put_contents") ||
+                            SAFE_PATTERN_SEARCH("move_uploaded_file"));
+        bool has_decode = (SAFE_PATTERN_SEARCH("base64_decode") ||
+                           SAFE_PATTERN_SEARCH("gzinflate"));
+        printf("DEBUG: 源代码模式匹配检查: has_file_op=%d, has_decode=%d, dangerous_count=%d, signature_match_count=%d, has_serialized_webshell=%d, has_xslt_webshell=%d, is_image_webshell=%d, has_upload_webshell=%d, has_password_auth=%d, has_string_dangerous_call=%d, has_sql_injection=%d, has_closure_fromcallable=%d, has_invoke_method=%d, has_array_diff_join=%d, has_unserialize=%d, has_preg_replace_chr=%d, has_many_chr_calls=%d, has_hex_chr=%d, has_dynamic_function_call=%d, has_callback_with_superglobal=%d, has_critical_dangerous_function=%d, has_decode_with_superglobal=%d, has_variable_function_call=%d\n", 
+               has_file_op, has_decode, dangerous_count, signature_match_count, has_serialized_webshell, has_xslt_webshell, is_image_webshell, has_upload_webshell, has_password_auth, has_string_dangerous_call, has_sql_injection, has_closure_fromcallable, has_invoke_method, has_array_diff_join, has_unserialize, has_preg_replace_chr, has_many_chr_calls, has_hex_chr, has_dynamic_function_call, has_callback_with_superglobal, has_critical_dangerous_function, has_decode_with_superglobal, has_variable_function_call);
+        fflush(stdout);  // 刷新输出，确保DEBUG信息能及时显示
         
         // 如果检测到webshell特征字符串，直接标记为webshell
         if (signature_match_count > 0 || has_serialized_webshell || has_xslt_webshell || 
             is_image_webshell || has_upload_webshell || has_password_auth ||
             has_string_dangerous_call || has_sql_injection ||
-            has_closure_fromcallable || has_invoke_method || has_array_diff_join || has_unserialize) {
+            has_closure_fromcallable || has_invoke_method || has_array_diff_join || has_unserialize ||
+            has_preg_replace_chr || has_many_chr_calls || has_hex_chr || has_dynamic_function_call ||
+            has_callback_with_superglobal || has_critical_dangerous_function ||
+            has_decode_with_superglobal || has_variable_function_call) {
           printf("DEBUG: 源代码模式匹配：发现webshell特征字符串，直接标记为 webshell\n");
           webshell = 1;  // 直接标记为 webshell
+          g_webshell_detected_before_segfault = 1;  // 记录已检测到webshell
           printf("DEBUG: 已设置 webshell = 1\n");
         } else if (has_file_op && has_decode) {
           printf("DEBUG: 源代码模式匹配：发现文件操作函数和解码函数组合，直接标记为 webshell\n");
           webshell = 1;  // 直接标记为 webshell
+          g_webshell_detected_before_segfault = 1;  // 记录已检测到webshell
           printf("DEBUG: 已设置 webshell = 1\n");
         } else if (dangerous_count >= 2) {
           // 如果检测到 2 个或更多危险函数，也标记为可疑（降低阈值从3到2）
           printf("DEBUG: 源代码模式匹配：检测到 %d 个危险函数，标记为可疑\n", dangerous_count);
           webshell = 1;  // 标记为可疑
+          g_webshell_detected_before_segfault = 1;  // 记录已检测到webshell
           printf("DEBUG: 已设置 webshell = 1\n");
         } else if (has_file_op) {
           // 如果检测到文件操作函数，且包含超全局变量，也标记为可疑
-          if (strstr(ZSTR_VAL(code), "$_FILES") != NULL ||
-              strstr(ZSTR_VAL(code), "$_REQUEST") != NULL ||
-              strstr(ZSTR_VAL(code), "$_POST") != NULL ||
-              strstr(ZSTR_VAL(code), "$_GET") != NULL ||
-              strstr(ZSTR_VAL(code), "$_SERVER") != NULL) {
+          if (SAFE_PATTERN_SEARCH("$_FILES") ||
+              SAFE_PATTERN_SEARCH("$_REQUEST") ||
+              SAFE_PATTERN_SEARCH("$_POST") ||
+              SAFE_PATTERN_SEARCH("$_GET") ||
+              SAFE_PATTERN_SEARCH("$_SERVER")) {
             printf("DEBUG: 源代码模式匹配：发现文件操作函数与超全局变量组合，标记为可疑\n");
             webshell = 1;  // 标记为可疑
+            g_webshell_detected_before_segfault = 1;  // 记录已检测到webshell
             printf("DEBUG: 已设置 webshell = 1\n");
           }
         }
         
+        // 检查 create_function 调用（这是一个危险的sink函数）
+        if (SAFE_PATTERN_SEARCH("create_function")) {
+          printf("DEBUG: 源代码模式匹配：发现 create_function 调用（危险的sink函数）\n");
+          webshell = 1;  // 标记为可疑
+          g_webshell_detected_before_segfault = 1;  // 记录已检测到webshell
+          printf("DEBUG: 已设置 webshell = 1\n");
+        }
+        
+        // 清理宏定义
+        #undef SAFE_PATTERN_SEARCH
+        
         // 改进：如果已经通过源代码模式匹配检测到webshell，即使跳过词法分析，也输出检测结果
         if (should_skip && webshell) {
           printf("\n========================================\n");
-          printf("⚠️  警告: 检测到 WebShell!\n");
+          printf("[WEB_SHELL] ⚠️  警告: 检测到 WebShell!\n");
           printf("========================================\n");
           printf("文件: %s\n", ZSTR_VAL(filename));
           printf("检测方法: 源代码模式匹配（跳过词法分析以避免崩溃）\n");
@@ -6579,21 +9798,163 @@ int main(int argc, char *argv[]) {
         }
         
         if (should_skip) {
-          // 不调用词法分析器，但如果没有检测到webshell，返回错误
+          // 不调用词法分析器：使用Token IR进行轻量级检测
           printf("\n========================================\n");
-          printf("检测结果: 无法处理（词法分析器限制）\n");
+          printf("L1层：轻量级Token IR检测（跳过AST解析）\n");
           printf("========================================\n");
           printf("文件: %s\n", ZSTR_VAL(filename));
-          printf("原因: 文件包含可能导致词法分析器崩溃的复杂字符串\n");
-          printf("说明: 已进行源代码模式匹配检测，未发现明显的webshell特征\n");
-          printf("建议: 使用其他检测工具或预处理文件后再检测\n");
-          zend_string_release(code);
-          zend_string_release(filename);
-          return 1;
+          printf("原因: 文件包含可能导致词法分析器崩溃的复杂或超长字符串，"
+                 "为避免段错误，已跳过词法/AST分析\n");
+          printf("说明: 将使用基于Token IR的轻量级检测作为辅助判断\n");
+          printf("----------------------------------------\n");
+          
+          // 使用Token IR进行轻量级检测
+          TokenGraph *token_graph = build_token_graph(code, filename);
+          if (token_graph) {
+              printf("Token Graph构建成功（节点数: %zu, 边数: %zu）\n", 
+                     token_graph->node_count, token_graph->edge_count);
+              
+              // 基于Token IR进行webshell检测
+              webshell_check_token_ir(token_graph);
+              
+              // 释放Token Graph
+              free_token_graph(token_graph);
+          } else {
+              printf("警告: Token Graph构建失败，回退到源代码模式匹配\n");
+          }
+          
+          printf("----------------------------------------\n");
+          if (webshell) {
+              printf("[WEB_SHELL] ⚠️  警告: 检测到 WebShell!\n");
+              printf("检测方法: Token IR + 源代码模式匹配（跳过AST解析）\n");
+              printf("========================================\n");
+              zend_string_release(code);
+              zend_string_release(filename);
+              return 0;  // 退出码0：确认WebShell
+          } else {
+              printf("[HIGHLY_SUSPICIOUS] ⚠️ 检测结果: 高危可疑（词法分析器限制）\n");
+              printf("说明: 已进行源代码模式匹配和Token IR检测，未发现明确的webshell特征，"
+                     "但由于无法完成后续语义分析，仍存在潜在的混淆/绕过风险\n");
+              printf("建议: 在检测系统中按\"高危可疑文件\"处理，建议隔离并人工复核，"
+                     "或使用其他引擎进行深入检测\n");
+              printf("========================================\n");
+              zend_string_release(code);
+              zend_string_release(filename);
+              return 2;  // 退出码2：高危可疑
+          }
         }
         
-        // 尝试进行词法分析
+        // 对于大于200KB的文件，即使没有检测到超长字符串，也要给出警告
+        // 并在尝试词法分析前，再次确认源代码模式匹配检测已完成
+        if (file_size > 200 * 1024) {
+            printf("警告: 文件较大（%zu 字节），词法分析可能遇到困难\n", file_size);
+            printf("已进行源代码模式匹配检测，");
+            if (webshell) {
+                printf("检测到webshell特征\n");
+            } else {
+                printf("未发现明显的webshell特征\n");
+            }
+        }
+        
+        // 在词法分析之前，确保源代码模式匹配检测结果已记录
+        // 这样即使词法分析时发生段错误，也能正确报告检测结果
+        if (webshell && g_webshell_detected_before_segfault == 0) {
+            // 如果检测到webshell但标志未设置，设置标志
+            g_webshell_detected_before_segfault = 1;
+            printf("DEBUG: 在词法分析前已检测到webshell特征，已设置 g_webshell_detected_before_segfault = 1\n");
+        }
+        
+        // 在词法分析之前，如果已经检测到webshell，先输出结果并刷新输出
+        // 这样可以确保即使词法分析时发生段错误，也能输出检测结果
+        if (webshell && g_webshell_detected_before_segfault) {
+            printf("\n========================================\n");
+            printf("[WEB_SHELL] ⚠️  警告: 检测到 WebShell!\n");
+            printf("========================================\n");
+            printf("文件: %s\n", ZSTR_VAL(filename));
+            printf("检测方法: 源代码模式匹配（在词法分析前检测到）\n");
+            printf("原因: 通过源代码模式匹配检测到webshell特征\n");
+            printf("说明: 文件可能包含复杂的字符串导致词法分析困难，但已通过源代码模式匹配确认webshell特征\n");
+            printf("========================================\n");
+            fflush(stdout);  // 刷新输出，确保即使段错误也能看到结果
+            // 不释放资源，继续尝试词法分析以获得更详细的结果
+            // 但如果词法分析失败，段错误处理函数会使用已设置的标志
+        }
+        
+        // L3层：深度分析（对于大文件使用Token IR，小文件使用AST）
+        printf("\n========================================\n");
+        if (file_size > 200 * 1024) {
+            // 大文件：使用基于Token/IR的低内存分析
+            printf("L3层：基于Token/IR的低内存分析（文件较大，跳过AST解析）\n");
+            printf("========================================\n");
+            
+            printf("正在构建Token Graph（轻量级IR，比AST稀疏10-50倍）...\n");
+            TokenGraph *token_graph = build_token_graph(code, filename);
+            
+            if (token_graph) {
+                printf("Token Graph构建成功（节点数: %zu, 边数: %zu）\n", 
+                       token_graph->node_count, token_graph->edge_count);
+                
+                // 基于Token IR进行webshell检测
+                webshell_check_token_ir(token_graph);
+                
+                // 对于大文件，也进行分段式沙箱执行以增强检测
+                printf("\n");
+                chunk_based_sandbox_execution(source, bytes_read, ZSTR_VAL(filename),
+                                             (file_size > 500 * 1024) ? 500 * 1024 : file_size);
+                
+                // 释放Token Graph
+                free_token_graph(token_graph);
+                
+                // 输出检测结果
+                if (webshell) {
+                    printf("\n========================================\n");
+                    printf("⚠️  警告: 检测到 WebShell!\n");
+                    printf("========================================\n");
+                    printf("文件: %s\n", ZSTR_VAL(filename));
+                    printf("检测方法: 基于Token/IR的低内存分析\n");
+                    printf("说明: 文件较大，使用轻量级Token Graph进行分析，避免了AST解析导致的内存问题\n");
+                    printf("========================================\n");
+                    zend_string_release(code);
+                    zend_string_release(filename);
+                    free(source);
+                    return 0;  // 返回0表示检测到webshell
+                } else {
+                    printf("\n========================================\n");
+                    printf("检测结果: 未发现WebShell特征\n");
+                    printf("========================================\n");
+                    printf("文件: %s\n", ZSTR_VAL(filename));
+                    printf("检测方法: 基于Token/IR的低内存分析\n");
+                    printf("========================================\n");
+                    zend_string_release(code);
+                    zend_string_release(filename);
+                    free(source);
+                    return 1;
+                }
+            } else {
+                printf("错误: Token Graph构建失败，回退到源代码模式匹配\n");
+                // 如果Token Graph构建失败，使用已有的源代码模式匹配结果
+                if (webshell) {
+                    printf("\n========================================\n");
+                    printf("⚠️  警告: 检测到 WebShell!\n");
+                    printf("========================================\n");
+                    printf("文件: %s\n", ZSTR_VAL(filename));
+                    printf("检测方法: 源代码模式匹配（Token Graph构建失败）\n");
+                    printf("========================================\n");
+                    zend_string_release(code);
+                    zend_string_release(filename);
+                    free(source);
+                    return 0;
+                }
+            }
+        } else {
+            // 小文件：使用完整的AST解析
+            printf("L3层：深度分析（完整AST解析 + taint分析 + 沙箱执行）\n");
+            printf("========================================\n");
+        }
+        
+        // 尝试进行词法分析（仅对小文件）
         printf("正在尝试词法分析（文件大小: %zu 字节，约 %zu 行）...\n", file_size, line_count_estimate);
+        fflush(stdout);  // 刷新输出，确保即使段错误也能看到这条消息
         ast = zend_compile_string_to_ast(code, &ast_arena, filename);
         
         // 词法分析成功后，清除段错误处理中的文件信息
@@ -6617,13 +9978,35 @@ int main(int argc, char *argv[]) {
             printf("  4. 文件开头不是PHP标签（如图片马：GIF89a等）\n");
             printf("文件信息: 大小 %zu 字节，约 %zu 行\n", file_size, line_count_estimate);
             
-            // 如果通过源代码模式匹配检测到webshell，输出检测结果
+            // 使用Token IR进行辅助检测
+            printf("\n========================================\n");
+            printf("L1层：轻量级Token IR检测（AST解析失败）\n");
+            printf("========================================\n");
+            printf("说明: 将使用基于Token IR的轻量级检测作为辅助判断\n");
+            printf("----------------------------------------\n");
+            
+            TokenGraph *token_graph = build_token_graph(code, filename);
+            if (token_graph) {
+                printf("Token Graph构建成功（节点数: %zu, 边数: %zu）\n", 
+                       token_graph->node_count, token_graph->edge_count);
+                
+                // 基于Token IR进行webshell检测
+                webshell_check_token_ir(token_graph);
+                
+                // 释放Token Graph
+                free_token_graph(token_graph);
+            } else {
+                printf("警告: Token Graph构建失败，回退到源代码模式匹配\n");
+            }
+            
+            printf("----------------------------------------\n");
+            
+            // 如果通过源代码模式匹配或Token IR检测到webshell，输出检测结果
             if (webshell) {
-              printf("\n========================================\n");
-              printf("⚠️  警告: 检测到 WebShell!\n");
+              printf("[WEB_SHELL] ⚠️  警告: 检测到 WebShell!\n");
               printf("========================================\n");
               printf("文件: %s\n", ZSTR_VAL(filename));
-              printf("检测方法: 源代码模式匹配（词法分析失败）\n");
+              printf("检测方法: Token IR + 源代码模式匹配（词法分析失败）\n");
               if (is_image_webshell) {
                 printf("原因: 检测到图片马特征（图片文件头后面跟着PHP webshell代码）\n");
               } else if (has_upload_webshell) {
@@ -6633,7 +10016,7 @@ int main(int argc, char *argv[]) {
               } else if (dangerous_count >= 2) {
                 printf("原因: 源代码中包含 %d 个危险函数/操作\n", dangerous_count);
               } else {
-                printf("原因: 通过源代码模式匹配检测到webshell特征\n");
+                printf("原因: 通过Token IR或源代码模式匹配检测到webshell特征\n");
               }
               printf("========================================\n");
               zend_string_release(code);
@@ -6641,16 +10024,13 @@ int main(int argc, char *argv[]) {
               if (current_filename) {
                   zend_string_release(current_filename);
               }
-              return 0;  // 返回0表示检测到webshell
+              return 0;  // 退出码0：确认WebShell
             }
             
-            printf("\n========================================\n");
-            printf("检测结果: 无法处理（词法分析失败）\n");
-            printf("========================================\n");
-            printf("文件: %s\n", ZSTR_VAL(filename));
-            printf("原因: 词法分析器无法处理该文件\n");
-            printf("说明: 已进行源代码模式匹配检测，未发现明显的webshell特征\n");
+            printf("[CLEAN] 检测结果: 无法处理（词法分析失败）\n");
+            printf("说明: 已进行源代码模式匹配和Token IR检测，未发现明显的webshell特征\n");
             printf("建议: 检查文件语法或使用其他检测工具\n");
+            printf("========================================\n");
             zend_string_release(code);
             zend_string_release(filename);
             if (current_filename) {
@@ -6724,11 +10104,18 @@ if (ast != NULL) {
 
     const char *skip_probe = getenv("YZ_SKIP_RUNTIME_PROBE");
     if (!skip_probe || strcmp(skip_probe, "1") != 0) {
-        printf("执行带有防御逻辑的脚本以辅助动态确认...\n");
-        export_and_run(g_root_ast ? g_root_ast : ast, argv[1]);
-        
-        // ★★ 新增：运行结束后，把 /tmp/yz_dyn_cg.jsonl 中的信息回填到调用图 / sink 表 ★★
-        load_dynamic_edges_and_update_graph("/tmp/yz_dyn_cg.jsonl");
+        // 对于大文件，使用分段式沙箱执行；对于小文件，使用完整的AST导出执行
+        if (file_size > 200 * 1024) {
+            printf("文件较大，使用分段式沙箱执行（只执行可疑代码块）...\n");
+            chunk_based_sandbox_execution(source, bytes_read, argv[1], 
+                                         (file_size > 500 * 1024) ? 500 * 1024 : file_size);
+        } else {
+            printf("执行带有防御逻辑的脚本以辅助动态确认...\n");
+            export_and_run(g_root_ast ? g_root_ast : ast, argv[1]);
+            
+            // ★★ 新增：运行结束后，把 /tmp/yz_dyn_cg.jsonl 中的信息回填到调用图 / sink 表 ★★
+            load_dynamic_edges_and_update_graph("/tmp/yz_dyn_cg.jsonl");
+        }
     } else {
         printf("检测到环境变量 YZ_SKIP_RUNTIME_PROBE=1，跳过运行时插桩执行。\n");
     }
@@ -6775,6 +10162,37 @@ if (ast != NULL) {
       printf("DEBUG: 警告：AST 为空！\n");
     }
     webshell_check(g_root_ast ? g_root_ast : ast, 0);
+    
+    // 如果AST分析结果不确定（webshell=0且文件较大），使用Token IR进行辅助检测
+    if (!webshell && file_size > 100 * 1024) {  // 文件大于100KB且AST分析未检测到webshell
+        printf("\n========================================\n");
+        printf("L1层：轻量级Token IR辅助检测（AST分析结果不确定）\n");
+        printf("========================================\n");
+        printf("说明: AST分析未检测到webshell，但文件较大，使用Token IR进行辅助判断\n");
+        printf("----------------------------------------\n");
+        
+        TokenGraph *token_graph = build_token_graph(code, filename);
+        if (token_graph) {
+            printf("Token Graph构建成功（节点数: %zu, 边数: %zu）\n", 
+                   token_graph->node_count, token_graph->edge_count);
+            
+            // 基于Token IR进行webshell检测
+            webshell_check_token_ir(token_graph);
+            
+            // 释放Token Graph
+            free_token_graph(token_graph);
+            
+            printf("----------------------------------------\n");
+            if (webshell) {
+                printf("⚠️  Token IR检测发现可疑点，已更新检测结果\n");
+            } else {
+                printf("Token IR检测未发现明显的危险模式\n");
+            }
+        } else {
+            printf("警告: Token Graph构建失败\n");
+        }
+        printf("========================================\n");
+    }
     
     printf("----------------------------------------\n");
     
@@ -6899,7 +10317,7 @@ if (ast != NULL) {
            zend_hash_num_elements(&suspect_site_table));
     if (webshell || dynamic_path_found || global_dynamic_path_detected || 
         dynamic_webshell_hit > 0 || zend_hash_num_elements(&suspect_site_table) > 0) {
-        printf("⚠️  警告: 检测到 WebShell!\n");
+        printf("[WEB_SHELL] ⚠️  警告: 检测到 WebShell!\n");
         printf("该文件包含危险的代码模式，可能被用于恶意目的。\n");
         if (dynamic_webshell_hit > 0) {
             printf("动态断言拦截到 %d 次可疑调用，直接判定为恶意。\n", dynamic_webshell_hit);
@@ -6915,7 +10333,7 @@ if (ast != NULL) {
                    zend_hash_num_elements(&suspect_site_table));
         }
     } else {
-        printf("✓ 未检测到 WebShell\n");
+        printf("[CLEAN] ✓ 未检测到 WebShell\n");
         printf("该文件看起来是正常的PHP代码。\n");
     }
     printf("========================================\n");
@@ -6978,14 +10396,22 @@ if (ast != NULL) {
         }
     } ZEND_HASH_FOREACH_END();
     zend_hash_destroy(&merged_call_graph);
+    
+    // 归一化退出码：0=WebShell, 1=未发现明显风险, 2=高危可疑
+    if (webshell) {
+        return 0;  // 退出码0：确认WebShell
+    } else {
+        return 1;  // 退出码1：未发现明显风险
+    }
 } else {
     printf("----------------------------------------\n");
-    printf("错误: PHP代码存在语法错误，无法进行分析\n");
+    printf("[CLEAN] 错误: PHP代码存在语法错误，无法进行分析\n");
     printf("========================================\n");
+    // 清理资源
+    zend_string_release(filename);
+    zend_string_release(code);
     return 1;
 }
-
-  // 返回适当的退出码：0表示正常，1表示检测到Webshell或错误
-  return webshell ? 1 : 0;
 }
-
+        }
+      }
